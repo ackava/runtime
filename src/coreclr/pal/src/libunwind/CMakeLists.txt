@@ -71,9 +71,7 @@ if(CLR_CMAKE_HOST_UNIX)
     endif()
 
     if (CLR_CMAKE_HOST_OSX)
-        add_definitions(-D_XOPEN_SOURCE)
         add_definitions(-DUNW_REMOTE_ONLY)
-        add_definitions(-D__APPLE__)
         add_compile_options(-Wno-sometimes-uninitialized)
         add_compile_options(-Wno-implicit-function-declaration)
 
@@ -124,7 +122,6 @@ if(CLR_CMAKE_HOST_WIN32)
     endif ()
 
     # Assume we are using default MSVC compiler
-    add_compile_options(/std:c++latest)
     add_compile_options(/TC) # compile all files as C
     add_compile_options(/permissive-)
 
@@ -148,6 +145,8 @@ if(CLR_CMAKE_HOST_WIN32)
     add_compile_options(-wd4311) # pointer truncation from 'unw_word_t *' to 'long'
     add_compile_options(-wd4475) # 'fprintf' : length modifier 'L' cannot be used
     add_compile_options(-wd4477) # fprintf argument type
+
+    add_compile_options(-wd9025) # overriding '/TP' with '/TC'
 endif (CLR_CMAKE_HOST_WIN32)
 
 if(CLR_CMAKE_TARGET_ARCH_ARM)

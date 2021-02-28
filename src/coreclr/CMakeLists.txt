@@ -96,6 +96,13 @@ if(CLR_CMAKE_TARGET_WIN32 AND CLR_CMAKE_BUILD_SUBSET_RUNTIME)
   add_subdirectory(gc/sample)
 endif()
 
+#-------------------------------------
+# Include directory directives
+#-------------------------------------
+# Include the basic prebuilt headers - required for getting fileversion resource details.
+include_directories("pal/prebuilt/inc")
+include_directories("../../artifacts/obj/coreclr")
+
 add_subdirectory(tools/aot/jitinterface)
 
 # Above projects do not build with these compile options
@@ -112,19 +119,16 @@ endif(CLR_CMAKE_HOST_WIN32)
 #----------------------------------
 include(clrdefinitions.cmake)
 
-#-------------------------------------
-# Include directory directives
-#-------------------------------------
-# Include the basic prebuilt headers - required for getting fileversion resource details.
-include_directories("pal/prebuilt/inc")
-include_directories("../../artifacts/obj/coreclr")
-
 if(FEATURE_STANDALONE_GC)
   add_definitions(-DFEATURE_STANDALONE_GC)
   if (CLR_CMAKE_BUILD_SUBSET_RUNTIME)
     add_subdirectory(gc)
   endif (CLR_CMAKE_BUILD_SUBSET_RUNTIME)
 endif(FEATURE_STANDALONE_GC)
+
+if(CLR_CMAKE_BUILD_SUBSET_RUNTIME AND NOT CLR_CROSS_COMPONENTS_BUILD)
+  add_subdirectory(${CLR_SRC_NATIVE_DIR}/corehost/apphost/static Corehost.Static)
+endif()
 
 if (CLR_CMAKE_HOST_UNIX)
   include_directories("pal/inc")
@@ -167,8 +171,7 @@ if(CLR_CMAKE_HOST_UNIX)
 
   set (NATIVE_RESOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/nativeresources)
   include_directories(${NATIVE_RESOURCE_DIR})
-  set (RC_TO_CPP ${NATIVE_RESOURCE_DIR}/rctocpp.awk)
-  set (PROCESS_RC ${NATIVE_RESOURCE_DIR}/processrc.awk)
+  set (PROCESS_RC_SCRIPT ${NATIVE_RESOURCE_DIR}/processrc.sh)
   set (RESOURCE_STRING_HEADER_DIR ${NATIVE_RESOURCE_DIR})
 
   # Create a command to create a C++ source file containing an array of
@@ -186,8 +189,8 @@ if(CLR_CMAKE_HOST_UNIX)
     add_custom_command(
       OUTPUT ${RESOURCE_ENTRY_ARRAY_CPP}
       # Convert the preprocessed .rc file to a C++ file which will be used to make a static lib.
-      COMMAND ${AWK} -v name=${TARGET_NAME} -f ${RC_TO_CPP} -f ${PROCESS_RC} ${PREPROCESSED_SOURCE} >${RESOURCE_ENTRY_ARRAY_CPP}
-            DEPENDS ${PREPROCESSED_SOURCE} ${RC_TO_CPP} ${PROCESS_RC}
+      COMMAND ${PROCESS_RC_SCRIPT} ${PREPROCESSED_SOURCE} ${TARGET_NAME} >${RESOURCE_ENTRY_ARRAY_CPP}
+            DEPENDS ${PREPROCESSED_SOURCE} ${PROCESS_RC_SCRIPT}
     )
 
     include_directories(${RESOURCE_STRING_HEADER_DIR})

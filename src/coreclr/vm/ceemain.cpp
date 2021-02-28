@@ -212,8 +212,8 @@
 #include "perfmap.h"
 #endif
 
-#include "diagnosticserver.h"
-#include "eventpipe.h"
+#include "diagnosticserveradapter.h"
+#include "eventpipeadapter.h"
 
 #ifndef TARGET_UNIX
 // Included for referencing __security_cookie
@@ -593,13 +593,18 @@ do { \
 
 #ifndef CROSSGEN_COMPILE
 #ifdef TARGET_UNIX
-void EESocketCleanupHelper()
+void EESocketCleanupHelper(bool isExecutingOnAltStack)
 {
     CONTRACTL
     {
         GC_NOTRIGGER;
         MODE_ANY;
     } CONTRACTL_END;
+
+    if (isExecutingOnAltStack)
+    {
+        GetThread()->SetExecutingOnAltStack();
+    }
 
     // Close the debugger transport socket first
     if (g_pDebugInterface != NULL)
@@ -609,7 +614,7 @@ void EESocketCleanupHelper()
 
     // Close the diagnostic server socket.
 #ifdef FEATURE_PERFTRACING
-    DiagnosticServer::Shutdown();
+    DiagnosticServerAdapter::Shutdown();
 #endif // FEATURE_PERFTRACING
 }
 #endif // TARGET_UNIX
@@ -691,7 +696,7 @@ void EEStartupHelper()
 
 #ifdef FEATURE_PERFTRACING
         // Initialize the event pipe.
-        EventPipe::Initialize();
+        EventPipeAdapter::Initialize();
 #endif // FEATURE_PERFTRACING
         GenAnalysis::Initialize();
 
@@ -704,15 +709,16 @@ void EEStartupHelper()
             unsigned facilities = REGUTIL::GetConfigDWORD_DontUse_(CLRConfig::INTERNAL_LogFacility, LF_ALL);
             unsigned level = REGUTIL::GetConfigDWORD_DontUse_(CLRConfig::EXTERNAL_LogLevel, LL_INFO1000);
             unsigned bytesPerThread = REGUTIL::GetConfigDWORD_DontUse_(CLRConfig::UNSUPPORTED_StressLogSize, STRESSLOG_CHUNK_SIZE * 4);
-            unsigned totalBytes = REGUTIL::GetConfigDWORD_DontUse_(CLRConfig::UNSUPPORTED_TotalStressLogSize, STRESSLOG_CHUNK_SIZE * 1024);
-            StressLog::Initialize(facilities, level, bytesPerThread, totalBytes, GetClrModuleBase());
+            ULONGLONG totalBytes = REGUTIL::GetConfigULONGLONG_DontUse_(CLRConfig::UNSUPPORTED_TotalStressLogSize, STRESSLOG_CHUNK_SIZE * 1024);
+            LPWSTR logFilename = REGUTIL::GetConfigString_DontUse_(CLRConfig::UNSUPPORTED_StressLogFilename);
+            StressLog::Initialize(facilities, level, bytesPerThread, totalBytes, GetClrModuleBase(), logFilename);
             g_pStressLog = &StressLog::theLog;
         }
 #endif
 
 #ifdef FEATURE_PERFTRACING
-        DiagnosticServer::Initialize();
-        DiagnosticServer::PauseForDiagnosticsMonitor();
+        DiagnosticServerAdapter::Initialize();
+        DiagnosticServerAdapter::PauseForDiagnosticsMonitor();
 #endif // FEATURE_PERFTRACING
 
 #ifdef FEATURE_GDBJIT
@@ -961,7 +967,7 @@ void EEStartupHelper()
         // Finish setting up rest of EventPipe - specifically enable SampleProfiler if it was requested at startup.
         // SampleProfiler needs to cooperate with the GC which hasn't fully finished setting up in the first part of the
         // EventPipe initialization, so this is done after the GC has been fully initialized.
-        EventPipe::FinishInitialize();
+        EventPipeAdapter::FinishInitialize();
 #endif // FEATURE_PERFTRACING
 
         // This isn't done as part of InitializeGarbageCollector() above because thread
@@ -986,6 +992,8 @@ void EEStartupHelper()
 #endif
 
 #endif // CROSSGEN_COMPILE
+
+        Assembly::Initialize();
 
 #if defined(HOST_OSX) && defined(HOST_ARM64)
         PAL_JITWriteEnable(true);
@@ -1228,13 +1236,24 @@ void STDMETHODCALLTYPE EEShutDownHelper(BOOL fIsDllUnloading)
     // Used later for a callback.
     CEEInfo ceeInf;
 
+#ifdef FEATURE_PGO
+    EX_TRY
+    {
+        PgoManager::Shutdown();
+    }
+    EX_CATCH
+    {
+    }
+    EX_END_CATCH(SwallowAllExceptions);
+#endif
+
     if (!fIsDllUnloading)
     {
         ETW::EnumerationLog::ProcessShutdown();
 
 #ifdef FEATURE_PERFTRACING
-        EventPipe::Shutdown();
-        DiagnosticServer::Shutdown();
+        EventPipeAdapter::Shutdown();
+        DiagnosticServerAdapter::Shutdown();
 #endif // FEATURE_PERFTRACING
     }
 
@@ -1339,10 +1358,6 @@ void STDMETHODCALLTYPE EEShutDownHelper(BOOL fIsDllUnloading)
 #ifdef FEATURE_PERFMAP
         // Flush and close the perf map file.
         PerfMap::Destroy();
-#endif
-
-#ifdef FEATURE_PGO
-        PgoManager::Shutdown();
 #endif
 
         {

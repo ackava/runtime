@@ -102,18 +102,13 @@ EXTERN_C void SinglecastDelegateInvokeStub();
 // Parameter size
 //**********************************************************************
 
-typedef INT32 StackElemType;
-#define STACK_ELEM_SIZE sizeof(StackElemType)
-
-
+inline unsigned StackElemSize(unsigned parmSize, bool isValueType = false /* unused */, bool isFloatHfa = false /* unused */)
+{
+    const unsigned stackSlotSize = 4;
+    return ALIGN_UP(parmSize, stackSlotSize);
+}
 
 #include "stublinkerx86.h"
-
-
-
-// !! This expression assumes STACK_ELEM_SIZE is a power of 2.
-#define StackElemSize(parmSize) (((parmSize) + STACK_ELEM_SIZE - 1) & ~((ULONG)(STACK_ELEM_SIZE - 1)))
-
 
 //**********************************************************************
 // Frames
@@ -452,21 +447,6 @@ EXTERN_C void __stdcall getFPReturn(int fpSize, INT64 *pretval);
 
 
 // SEH info forward declarations
-
-inline BOOL IsUnmanagedValueTypeReturnedByRef(UINT sizeofvaluetype)
-{
-    LIMITED_METHOD_CONTRACT;
-
-#ifndef UNIX_X86_ABI
-    // odd-sized small structures are not
-    //  enregistered e.g. struct { char a,b,c; }
-    return (sizeofvaluetype > 8) ||
-        (sizeofvaluetype & (sizeofvaluetype - 1)); // check that the size is power of two
-#else
-    // For UNIX_X86_ABI, we always return the value type by reference regardless of its size
-    return true;
-#endif
-}
 
 #include <pshpack1.h>
 struct DECLSPEC_ALIGN(4) UMEntryThunkCode

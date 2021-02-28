@@ -1,11 +1,12 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
-#ifndef _INTEROP_COMWRAPPERS_H_
-#define _INTEROP_COMWRAPPERS_H_
+#ifndef _INTEROP_COMWRAPPERS_HPP_
+#define _INTEROP_COMWRAPPERS_HPP_
 
 #include "platform.h"
 #include <interoplib.h>
+#include <interoplibabi.h>
 #include "referencetrackertypes.hpp"
 
 enum class CreateComInterfaceFlagsEx : int32_t
@@ -34,18 +35,19 @@ namespace ABI
 // Class for wrapping a managed object and projecting it in a non-managed environment
 class ManagedObjectWrapper
 {
-    friend constexpr size_t RefCountOffset();
+    friend constexpr size_t ManagedObjectWrapperRefCountOffset();
 public:
     Volatile<InteropLib::OBJECTHANDLE> Target;
 
 private:
+    LONGLONG _refCount;
+
     const int32_t _runtimeDefinedCount;
     const int32_t _userDefinedCount;
     const ABI::ComInterfaceEntry* _runtimeDefined;
     const ABI::ComInterfaceEntry* _userDefined;
     ABI::ComInterfaceDispatch* _dispatches;
 
-    LONGLONG _refCount;
     Volatile<CreateComInterfaceFlagsEx> _flags;
 
 public: // static
@@ -82,10 +84,6 @@ private:
 
     ~ManagedObjectWrapper();
 
-    // Represents a single implementation of how to release
-    // the wrapper. Supplied with a decrementing value.
-    ULONGLONG UniversalRelease(_In_ ULONGLONG dec);
-
     // Query the runtime defined tables.
     void* AsRuntimeDefined(_In_ REFIID riid);
 
@@ -102,8 +100,8 @@ public:
     void SetFlag(_In_ CreateComInterfaceFlagsEx flag);
     void ResetFlag(_In_ CreateComInterfaceFlagsEx flag);
 
-    // Used while validating wrapper is active.
-    ULONG IsActiveAddRef();
+    // Indicate if the wrapper should be considered a GC root.
+    bool IsRooted() const;
 
 public: // IReferenceTrackerTarget
     ULONG AddRefFromReferenceTracker();
@@ -119,27 +117,36 @@ public: // Lifetime
     ULONG Release(void);
 };
 
-// The Target and _refCount fields are used by the DAC, any changes to the layout must be updated on the DAC side (request.cpp)
-static constexpr size_t DACTargetOffset = 0;
-static_assert(offsetof(ManagedObjectWrapper, Target) == DACTargetOffset, "Keep in sync with DAC interfaces");
-static constexpr size_t DACRefCountOffset = (4 * sizeof(intptr_t)) + (2 * sizeof(int32_t));
-static constexpr size_t RefCountOffset()
+// ABI contract. This below offset is assumed in managed code and the DAC.
+ABI_ASSERT(offsetof(ManagedObjectWrapper, Target) == 0);
+
+static constexpr size_t ManagedObjectWrapperRefCountOffset()
 {
-    // _refCount is a private field and offsetof won't let you look at private fields. To overcome
-    // this RefCountOffset() is a friend function.
+    // _refCount is a private field and offsetof won't let you look at private fields.
+    // To overcome, this function is a friend function of ManagedObjectWrapper.
     return offsetof(ManagedObjectWrapper, _refCount);
 }
-static_assert(RefCountOffset() == DACRefCountOffset, "Keep in sync with DAC interfaces");
 
-// ABI contract. This below offset is assumed in managed code.
-ABI_ASSERT(offsetof(ManagedObjectWrapper, Target) == 0);
+// ABI contract used by the DAC.
+ABI_ASSERT(offsetof(ManagedObjectWrapper, Target) == offsetof(InteropLib::ABI::ManagedObjectWrapperLayout, ManagedObject));
+ABI_ASSERT(ManagedObjectWrapperRefCountOffset() == offsetof(InteropLib::ABI::ManagedObjectWrapperLayout, RefCount));
+
+// State ownership mechanism.
+enum class TrackerObjectState
+{
+    NotSet,
+    SetNoRelease,
+    SetForRelease,
+};
 
 // Class for connecting a native COM object to a managed object instance
 class NativeObjectWrapperContext
 {
     IReferenceTracker* _trackerObject;
     void* _runtimeContext;
-    Volatile<BOOL> _isValidTracker;
+    Volatile<BOOL> _trackerObjectDisconnected;
+    TrackerObjectState _trackerObjectState;
+    IUnknown* _nativeObjectAsInner;
 
 #ifdef _DEBUG
     size_t _sentinel;
@@ -151,6 +158,7 @@ public: // static
     // Create a NativeObjectWrapperContext instance
     static HRESULT NativeObjectWrapperContext::Create(
         _In_ IUnknown* external,
+        _In_opt_ IUnknown* nativeObjectAsInner,
         _In_ InteropLib::Com::CreateObjectFlags flags,
         _In_ size_t runtimeContextSize,
         _Outptr_ NativeObjectWrapperContext** context);
@@ -159,7 +167,7 @@ public: // static
     static void Destroy(_In_ NativeObjectWrapperContext* wrapper);
 
 private:
-    NativeObjectWrapperContext(_In_ void* runtimeContext, _In_opt_ IReferenceTracker* trackerObject);
+    NativeObjectWrapperContext(_In_ void* runtimeContext, _In_opt_ IReferenceTracker* trackerObject, _In_opt_ IUnknown* nativeObjectAsInner);
     ~NativeObjectWrapperContext();
 
 public:
@@ -171,6 +179,9 @@ public:
 
     // Disconnect reference tracker instance.
     void DisconnectTracker() noexcept;
+
+private:
+    void HandleReferenceTrackerAggregation() noexcept;
 };
 
 // Manage native object wrappers that support IReferenceTracker.
@@ -267,4 +278,4 @@ struct ComHolder
         }
     }
 };
-#endif // _INTEROP_COMWRAPPERS_H_
+#endif // _INTEROP_COMWRAPPERS_HPP_

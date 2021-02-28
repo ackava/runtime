@@ -729,50 +729,29 @@ public:
 #endif // FEATURE_COMINTEROP
 
 #if !defined(DACCESS_COMPILE)
-    // set m_pUMEntryThunkOrInterceptStub if not already set - return true if not already set
+    // set m_pUMEntryThunk if not already set - return true if not already set
     bool SetUMEntryThunk(void* pUMEntryThunk)
     {
         WRAPPER_NO_CONTRACT;
-        return (FastInterlockCompareExchangePointer(&m_pUMEntryThunkOrInterceptStub,
+        return (FastInterlockCompareExchangePointer(&m_pUMEntryThunk,
                                                     pUMEntryThunk,
                                                     NULL) == NULL);
     }
 
-    // set m_pUMEntryThunkOrInterceptStub if not already set - return true if not already set
-    bool SetInterceptStub(Stub* pInterceptStub)
-    {
-        WRAPPER_NO_CONTRACT;
-        void *pPtr = (void *)((UINT_PTR)pInterceptStub | 1);
-        return (FastInterlockCompareExchangePointer(&m_pUMEntryThunkOrInterceptStub,
-                                                    pPtr,
-                                                    NULL) == NULL);
-    }
-
-    void FreeUMEntryThunkOrInterceptStub();
+    void FreeUMEntryThunk();
 
 #endif // DACCESS_COMPILE
 
     void* GetUMEntryThunk()
     {
         LIMITED_METHOD_CONTRACT;
-        return (((UINT_PTR)m_pUMEntryThunkOrInterceptStub & 1) ? NULL : m_pUMEntryThunkOrInterceptStub);
-    }
-
-    Stub* GetInterceptStub()
-    {
-        LIMITED_METHOD_CONTRACT;
-        return (((UINT_PTR)m_pUMEntryThunkOrInterceptStub & 1) ? (Stub *)((UINT_PTR)m_pUMEntryThunkOrInterceptStub & ~1) : NULL);
+        return m_pUMEntryThunk;
     }
 
 private:
     // If this is a delegate marshalled out to unmanaged code, this points
     // to the thunk generated for unmanaged code to call back on.
-    // If this is a delegate representing an unmanaged function pointer,
-    // this may point to a stub that intercepts calls to the unmng target.
-    // An example of an intercept call is pInvokeStackImbalance MDA.
-    // We differentiate between a thunk or intercept stub by setting the lowest
-    // bit if it is an intercept stub.
-    void*               m_pUMEntryThunkOrInterceptStub;
+    void*               m_pUMEntryThunk;
 
 #ifdef FEATURE_COMINTEROP
     // If this object is being exposed to COM, it will have an associated CCW object
@@ -817,7 +796,8 @@ public:
             if (FastInterlockCompareExchangePointer((ManagedObjectComWrapperByIdMap**)&m_managedObjectComWrapperMap, (ManagedObjectComWrapperByIdMap *)map, NULL) == NULL)
             {
                 map.SuppressRelease();
-                m_managedObjectComWrapperLock.Init(CrstLeafLock);
+                // The GC thread does enumerate these objects so add CRST_UNSAFE_COOPGC.
+                m_managedObjectComWrapperLock.Init(CrstManagedObjectWrapperMap, CRST_UNSAFE_COOPGC);
             }
 
             _ASSERTE(m_managedObjectComWrapperMap != NULL);
@@ -832,8 +812,8 @@ public:
         return true;
     }
 
-    using EnumWrappersCallback = void(void* mocw);
-    void ClearManagedObjectComWrappers(EnumWrappersCallback* callback)
+    using ClearWrappersCallback = void(void* mocw);
+    void ClearManagedObjectComWrappers(ClearWrappersCallback* callback)
     {
         LIMITED_METHOD_CONTRACT;
 
@@ -853,6 +833,27 @@ public:
         }
 
         m_managedObjectComWrapperMap->RemoveAll();
+    }
+
+    using EnumWrappersCallback = bool(void* mocw, void* cxt);
+    void EnumManagedObjectComWrappers(EnumWrappersCallback* callback, void* cxt)
+    {
+        LIMITED_METHOD_CONTRACT;
+
+        _ASSERTE(callback != NULL);
+
+        if (m_managedObjectComWrapperMap == NULL)
+            return;
+
+        CrstHolder lock(&m_managedObjectComWrapperLock);
+
+        ManagedObjectComWrapperByIdMap::Iterator iter = m_managedObjectComWrapperMap->Begin();
+        while (iter != m_managedObjectComWrapperMap->End())
+        {
+            if (!callback(iter->Value(), cxt))
+                break;
+            ++iter;
+        }
     }
 #endif // !DACCESS_COMPILE
 

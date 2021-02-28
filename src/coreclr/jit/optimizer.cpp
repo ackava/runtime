@@ -161,18 +161,16 @@ void Compiler::optMarkLoopBlocks(BasicBlock* begBlk, BasicBlock* endBlk, bool ex
     for (flowList* pred = begBlk->bbPreds; pred != nullptr; pred = pred->flNext)
     {
         /* Is this a backedge? */
-        if (pred->flBlock->bbNum >= begBlk->bbNum)
+        if (pred->getBlock()->bbNum >= begBlk->bbNum)
         {
-            flowList* flow = new (this, CMK_FlowList) flowList();
+            flowList* flow = new (this, CMK_FlowList) flowList(pred->getBlock(), backedgeList);
 
 #if MEASURE_BLOCK_SIZE
             genFlowNodeCnt += 1;
             genFlowNodeSize += sizeof(flowList);
 #endif // MEASURE_BLOCK_SIZE
 
-            flow->flNext  = backedgeList;
-            flow->flBlock = pred->flBlock;
-            backedgeList  = flow;
+            backedgeList = flow;
         }
     }
 
@@ -199,7 +197,7 @@ void Compiler::optMarkLoopBlocks(BasicBlock* begBlk, BasicBlock* endBlk, bool ex
 
             for (flowList* tmp = backedgeList; tmp != nullptr; tmp = tmp->flNext)
             {
-                BasicBlock* backedge = tmp->flBlock;
+                BasicBlock* backedge = tmp->getBlock();
 
                 if (!curBlk->isRunRarely())
                 {
@@ -299,7 +297,7 @@ void Compiler::optUnmarkLoopBlocks(BasicBlock* begBlk, BasicBlock* endBlk)
 
     for (flowList* pred = begBlk->bbPreds; pred != nullptr; pred = pred->flNext)
     {
-        curBlk = pred->flBlock;
+        curBlk = pred->getBlock();
 
         /* is this a backward edge? (from curBlk to begBlk) */
 
@@ -1235,7 +1233,7 @@ bool Compiler::optRecordLoop(BasicBlock*   head,
         // i.e. every pred of ENTRY other than HEAD is in the loop.
         for (flowList* predEdge = entry->bbPreds; predEdge; predEdge = predEdge->flNext)
         {
-            BasicBlock* predBlock = predEdge->flBlock;
+            BasicBlock* predBlock = predEdge->getBlock();
             if ((predBlock != head) && !optLoopTable[loopInd].lpContains(predBlock))
             {
                 goto DONE_LOOP;
@@ -1379,7 +1377,7 @@ void Compiler::optCheckPreds()
             // make sure this pred is part of the BB list
             for (blockPred = fgFirstBB; blockPred; blockPred = blockPred->bbNext)
             {
-                if (blockPred == pred->flBlock)
+                if (blockPred == pred->getBlock())
                 {
                     break;
                 }
@@ -1868,7 +1866,7 @@ private:
             // Add preds to the worklist, checking for side-entries.
             for (flowList* predIter = block->bbPreds; predIter != nullptr; predIter = predIter->flNext)
             {
-                BasicBlock* pred = predIter->flBlock;
+                BasicBlock* pred = predIter->getBlock();
 
                 unsigned int testNum = PositionNum(pred);
 
@@ -1955,7 +1953,7 @@ private:
             // This must be a block we inserted to connect fall-through after moving blocks.
             // To determine if it's in the loop or not, use the number of its unique predecessor
             // block.
-            assert(block->bbPreds->flBlock == block->bbPrev);
+            assert(block->bbPreds->getBlock() == block->bbPrev);
             assert(block->bbPreds->flNext == nullptr);
             return block->bbPrev->bbNum;
         }
@@ -2146,7 +2144,7 @@ private:
         // algorithm, and isn't desirable layout anyway.
         for (flowList* predIter = newMoveAfter->bbPreds; predIter != nullptr; predIter = predIter->flNext)
         {
-            unsigned int predNum = predIter->flBlock->bbNum;
+            unsigned int predNum = predIter->getBlock()->bbNum;
 
             if ((predNum >= top->bbNum) && (predNum <= bottom->bbNum) && !loopBlocks.IsMember(predNum))
             {
@@ -2216,7 +2214,7 @@ private:
         {
             for (flowList* predIter = testBlock->bbPreds; predIter != nullptr; predIter = predIter->flNext)
             {
-                BasicBlock*  testPred           = predIter->flBlock;
+                BasicBlock*  testPred           = predIter->getBlock();
                 unsigned int predPosNum         = PositionNum(testPred);
                 unsigned int firstNonLoopPosNum = PositionNum(firstNonLoopBlock);
                 unsigned int lastNonLoopPosNum  = PositionNum(lastNonLoopBlock);
@@ -2445,7 +2443,7 @@ void Compiler::optFindNaturalLoops()
 
         for (flowList* pred = top->bbPreds; pred; pred = pred->flNext)
         {
-            if (search.FindLoop(head, top, pred->flBlock))
+            if (search.FindLoop(head, top, pred->getBlock()))
             {
                 // Found a loop; record it and see if we've hit the limit.
                 bool recordedLoop = search.RecordLoop();
@@ -2578,6 +2576,41 @@ NO_MORE_LOOPS:
         }
     }
 #endif // DEBUG
+}
+
+//-----------------------------------------------------------------------------
+//
+// All the inner loops that whose block weight meets a threshold are marked
+// as needing alignment.
+//
+
+void Compiler::optIdentifyLoopsForAlignment()
+{
+#if FEATURE_LOOP_ALIGN
+    if (codeGen->ShouldAlignLoops())
+    {
+        for (unsigned char loopInd = 0; loopInd < optLoopCount; loopInd++)
+        {
+            BasicBlock* first = optLoopTable[loopInd].lpFirst;
+
+            // An innerloop candidate that might need alignment
+            if (optLoopTable[loopInd].lpChild == BasicBlock::NOT_IN_LOOP)
+            {
+                if (first->getBBWeight(this) >= (opts.compJitAlignLoopMinBlockWeight * BB_UNITY_WEIGHT))
+                {
+                    first->bbFlags |= BBF_LOOP_ALIGN;
+                    JITDUMP("L%02u that starts at " FMT_BB " needs alignment, weight=%f.\n", loopInd, first->bbNum,
+                            first->getBBWeight(this));
+                }
+                else
+                {
+                    JITDUMP("Skip alignment for L%02u that starts at " FMT_BB " weight=%f.\n", loopInd, first->bbNum,
+                            first->getBBWeight(this));
+                }
+            }
+        }
+    }
+#endif
 }
 
 void Compiler::optRedirectBlock(BasicBlock* blk, BlockToBlockMap* redirectMap)
@@ -2842,7 +2875,7 @@ bool Compiler::optCanonicalizeLoop(unsigned char loopInd)
     bool firstPred = true;
     for (flowList* topPred = t->bbPreds; topPred != nullptr; topPred = topPred->flNext)
     {
-        BasicBlock* topPredBlock = topPred->flBlock;
+        BasicBlock* topPredBlock = topPred->getBlock();
 
         // Skip if topPredBlock is in the loop.
         // Note that this uses block number to detect membership in the loop. We are adding blocks during
@@ -3759,6 +3792,22 @@ void Compiler::optUnrollLoops()
 #endif
         }
 
+#if FEATURE_LOOP_ALIGN
+        for (block = head->bbNext;; block = block->bbNext)
+        {
+            if (block->isLoopAlign())
+            {
+                block->bbFlags &= ~BBF_LOOP_ALIGN;
+                JITDUMP("Removing LOOP_ALIGN flag from unrolled loop in " FMT_BB "\n", block->bbNum);
+            }
+
+            if (block == bottom)
+            {
+                break;
+            }
+        }
+#endif
+
         /* Create the unrolled loop statement list */
         {
             BlockToBlockMap blockMap(getAllocator());
@@ -3900,7 +3949,7 @@ void Compiler::optUnrollLoops()
             /* Make sure to update loop table */
 
             /* Use the LPFLG_REMOVED flag and update the bbLoopMask accordingly
-                * (also make head and bottom NULL - to hit an assert or GPF) */
+                * (also make head and bottom NULL - to hit an assert or an access violation) */
 
             optLoopTable[lnum].lpFlags |= LPFLG_REMOVED;
             optLoopTable[lnum].lpHead = optLoopTable[lnum].lpBottom = nullptr;
@@ -4036,11 +4085,23 @@ static Statement* optFindLoopTermTest(BasicBlock* bottom)
     return result;
 }
 
-/*****************************************************************************
- * Optimize "jmp C; do{} C:while(cond);" loops to "if (cond){ do{}while(cond}; }"
- */
-
-void Compiler::fgOptWhileLoop(BasicBlock* block)
+//-----------------------------------------------------------------------------
+// optInvertWhileLoop: modify flow and duplicate code so that for/while loops are
+//   entered at top and tested at bottom (aka loop rotation or bottom testing).
+//
+// Arguments:
+//   block -- block that may be the predecessor of the un-rotated loop's test block.
+//
+// Notes:
+//  Optimizes "jmp C; do{} C:while(cond);" loops to "if (cond){ do{}while(cond}; }"
+//  Does not modify every loop
+//
+//  Makes no changes if the flow pattern match fails.
+//
+//  May not modify a loop if profile is unfavorable, if the cost of duplicating
+//  code is large (factoring in potential CSEs)
+//
+void Compiler::optInvertWhileLoop(BasicBlock* block)
 {
     noway_assert(opts.OptimizationEnabled());
     noway_assert(compCodeOpt() != SMALL_CODE);
@@ -4162,12 +4223,12 @@ void Compiler::fgOptWhileLoop(BasicBlock* block)
     gtPrepareCost(condTree);
     unsigned estDupCostSz = condTree->GetCostSz();
 
-    double loopIterations = (double)BB_LOOP_WEIGHT_SCALE;
+    BasicBlock::weight_t loopIterations = BB_LOOP_WEIGHT_SCALE;
 
-    bool                 allProfileWeightsAreValid = false;
-    BasicBlock::weight_t weightBlock               = block->bbWeight;
-    BasicBlock::weight_t weightTest                = bTest->bbWeight;
-    BasicBlock::weight_t weightNext                = block->bbNext->bbWeight;
+    bool                       allProfileWeightsAreValid = false;
+    BasicBlock::weight_t const weightBlock               = block->bbWeight;
+    BasicBlock::weight_t const weightTest                = bTest->bbWeight;
+    BasicBlock::weight_t const weightNext                = block->bbNext->bbWeight;
 
     // If we have profile data then we calculate the number of time
     // the loop will iterate into loopIterations
@@ -4177,25 +4238,38 @@ void Compiler::fgOptWhileLoop(BasicBlock* block)
         // have good profile weights
         if (block->hasProfileWeight() && bTest->hasProfileWeight() && block->bbNext->hasProfileWeight())
         {
-            allProfileWeightsAreValid = true;
-
             // If this while loop never iterates then don't bother transforming
+            //
             if (weightNext == 0)
             {
                 return;
             }
 
-            // with (weighNext > 0) we should also have (weightTest >= weightBlock)
-            // if the profile weights are all valid.
+            // We generally expect weightTest == weightNext + weightBlock.
             //
-            //   weightNext is the number of time this loop iterates
-            //   weightBlock is the number of times that we enter the while loop
-            //   loopIterations is the average number of times that this loop iterates
+            // Tolerate small inconsistencies...
             //
-            if (weightTest >= weightBlock)
+            if (!fgProfileWeightsConsistent(weightBlock + weightNext, weightTest))
             {
-                loopIterations = (double)block->bbNext->bbWeight / (double)block->bbWeight;
+                JITDUMP("Profile weights locally inconsistent: block %f, next %f, test %f\n", weightBlock, weightNext,
+                        weightTest);
             }
+            else
+            {
+                allProfileWeightsAreValid = true;
+
+                // Determine iteration count
+                //
+                //   weightNext is the number of time this loop iterates
+                //   weightBlock is the number of times that we enter the while loop
+                //   loopIterations is the average number of times that this loop iterates
+                //
+                loopIterations = weightNext / weightBlock;
+            }
+        }
+        else
+        {
+            JITDUMP("Missing profile data for loop!\n");
         }
     }
 
@@ -4286,44 +4360,6 @@ void Compiler::fgOptWhileLoop(BasicBlock* block)
         block->bbFlags |= copyFlags;
     }
 
-    // If we have profile data for all blocks and we know that we are cloning the
-    //  bTest block into block and thus changing the control flow from block so
-    //  that it no longer goes directly to bTest anymore, we have to adjust the
-    //  weight of bTest by subtracting out the weight of block.
-    //
-    if (allProfileWeightsAreValid)
-    {
-        //
-        // Some additional sanity checks before adjusting the weight of bTest
-        //
-        if ((weightNext > 0) && (weightTest >= weightBlock) && (weightTest != BB_MAX_WEIGHT))
-        {
-            // Get the two edge that flow out of bTest
-            flowList* edgeToNext = fgGetPredForBlock(bTest->bbNext, bTest);
-            flowList* edgeToJump = fgGetPredForBlock(bTest->bbJumpDest, bTest);
-
-            // Calculate the new weight for block bTest
-
-            BasicBlock::weight_t newWeightTest =
-                (weightTest > weightBlock) ? (weightTest - weightBlock) : BB_ZERO_WEIGHT;
-            bTest->bbWeight = newWeightTest;
-
-            if (newWeightTest == BB_ZERO_WEIGHT)
-            {
-                bTest->bbFlags |= BBF_RUN_RARELY;
-                // All out edge weights are set to zero
-                edgeToNext->setEdgeWeights(BB_ZERO_WEIGHT, BB_ZERO_WEIGHT);
-                edgeToJump->setEdgeWeights(BB_ZERO_WEIGHT, BB_ZERO_WEIGHT);
-            }
-            else
-            {
-                // Update the our edge weights
-                edgeToNext->setEdgeWeights(BB_ZERO_WEIGHT, min(edgeToNext->edgeWeightMax(), newWeightTest));
-                edgeToJump->setEdgeWeights(BB_ZERO_WEIGHT, min(edgeToJump->edgeWeightMax(), newWeightTest));
-            }
-        }
-    }
-
     /* Change the block to end with a conditional jump */
 
     block->bbJumpKind = BBJ_COND;
@@ -4342,7 +4378,7 @@ void Compiler::fgOptWhileLoop(BasicBlock* block)
 #ifdef DEBUG
     if (verbose)
     {
-        printf("\nDuplicating loop condition in " FMT_BB " for loop (" FMT_BB " - " FMT_BB ")", block->bbNum,
+        printf("\nDuplicated loop condition in " FMT_BB " for loop (" FMT_BB " - " FMT_BB ")", block->bbNum,
                block->bbNext->bbNum, bTest->bbNum);
         printf("\nEstimated code size expansion is %d\n ", estDupCostSz);
 
@@ -4350,34 +4386,91 @@ void Compiler::fgOptWhileLoop(BasicBlock* block)
     }
 
 #endif
-}
 
-/*****************************************************************************
- *
- *  Optimize the BasicBlock layout of the method
- */
+    // If we have profile data for all blocks and we know that we are cloning the
+    // bTest block into block and thus changing the control flow from block so
+    // that it no longer goes directly to bTest anymore, we have to adjust
+    // various weights.
+    //
+    if (allProfileWeightsAreValid)
+    {
+        // Update the weight for bTest
+        //
+        JITDUMP("Reducing profile weight of " FMT_BB " from %f to %f\n", bTest->bbNum, weightTest, weightNext);
+        bTest->bbWeight = weightNext;
 
-void Compiler::optOptimizeLayout()
-{
-    noway_assert(opts.OptimizationEnabled());
+        // Determine the new edge weights.
+        //
+        // We project the next/jump ratio for block and bTest by using
+        // the original likelihoods out of bTest.
+        //
+        // Note "next" is the loop top block, not bTest's bbNext,
+        // we'll call this latter block "after".
+        //
+        BasicBlock::weight_t const testToNextLikelihood  = weightNext / weightTest;
+        BasicBlock::weight_t const testToAfterLikelihood = 1.0f - testToNextLikelihood;
+
+        // Adjust edges out of bTest (which now has weight weightNext)
+        //
+        BasicBlock::weight_t const testToNextWeight  = weightNext * testToNextLikelihood;
+        BasicBlock::weight_t const testToAfterWeight = weightNext * testToAfterLikelihood;
+
+        flowList* const edgeTestToNext  = fgGetPredForBlock(bTest->bbJumpDest, bTest);
+        flowList* const edgeTestToAfter = fgGetPredForBlock(bTest->bbNext, bTest);
+
+        JITDUMP("Setting weight of " FMT_BB " -> " FMT_BB " to %f (iterate loop)\n", bTest->bbNum,
+                bTest->bbJumpDest->bbNum, testToNextWeight);
+        JITDUMP("Setting weight of " FMT_BB " -> " FMT_BB " to %f (exit loop)\n", bTest->bbNum, bTest->bbNext->bbNum,
+                testToAfterWeight);
+
+        edgeTestToNext->setEdgeWeights(testToNextWeight, testToNextWeight);
+        edgeTestToAfter->setEdgeWeights(testToAfterWeight, testToAfterWeight);
+
+        // Adjust edges out of block, using the same distribution.
+        //
+        JITDUMP("Profile weight of " FMT_BB " remains unchanged at %f\n", block->bbNum, weightBlock);
+
+        BasicBlock::weight_t const blockToNextLikelihood  = testToNextLikelihood;
+        BasicBlock::weight_t const blockToAfterLikelihood = testToAfterLikelihood;
+
+        BasicBlock::weight_t const blockToNextWeight  = weightBlock * blockToNextLikelihood;
+        BasicBlock::weight_t const blockToAfterWeight = weightBlock * blockToAfterLikelihood;
+
+        flowList* const edgeBlockToNext  = fgGetPredForBlock(block->bbNext, block);
+        flowList* const edgeBlockToAfter = fgGetPredForBlock(block->bbJumpDest, block);
+
+        JITDUMP("Setting weight of " FMT_BB " -> " FMT_BB " to %f (enter loop)\n", block->bbNum, block->bbNext->bbNum,
+                blockToNextWeight);
+        JITDUMP("Setting weight of " FMT_BB " -> " FMT_BB " to %f (avoid loop)\n", block->bbNum,
+                block->bbJumpDest->bbNum, blockToAfterWeight);
+
+        edgeBlockToNext->setEdgeWeights(blockToNextWeight, blockToNextWeight);
+        edgeBlockToAfter->setEdgeWeights(blockToAfterWeight, blockToAfterWeight);
 
 #ifdef DEBUG
-    if (verbose)
-    {
-        printf("*************** In optOptimizeLayout()\n");
-        fgDispHandlerTab();
-    }
-
-    /* Check that the flowgraph data (bbNum, bbRefs, bbPreds) is up-to-date */
-    fgDebugCheckBBlist();
+        // Verify profile for the two target blocks is consistent.
+        //
+        fgDebugCheckIncomingProfileData(block->bbNext);
+        fgDebugCheckIncomingProfileData(block->bbJumpDest);
 #endif
+    }
+}
 
+//-----------------------------------------------------------------------------
+// optInvertLoops: invert while loops in the method
+//
+// Returns:
+//   suitable phase status
+//
+PhaseStatus Compiler::optInvertLoops()
+{
+    noway_assert(opts.OptimizationEnabled());
     noway_assert(fgModified == false);
 
     for (BasicBlock* block = fgFirstBB; block; block = block->bbNext)
     {
-        /* Make sure the appropriate fields are initialized */
-
+        // Make sure the appropriate fields are initialized
+        //
         if (block->bbWeight == BB_ZERO_WEIGHT)
         {
             /* Zero weighted block can't have a LOOP_HEAD flag */
@@ -4387,36 +4480,76 @@ void Compiler::optOptimizeLayout()
 
         if (compCodeOpt() != SMALL_CODE)
         {
-            /* Optimize "while(cond){}" loops to "cond; do{}while(cond);" */
-
-            fgOptWhileLoop(block);
+            optInvertWhileLoop(block);
         }
     }
 
-    if (fgModified)
+    bool madeChanges = fgModified;
+
+    if (madeChanges)
     {
-        // Recompute the edge weight if we have modified the flow graph in fgOptWhileLoop
-        fgComputeEdgeWeights();
+        // Reset fgModified here as we've done a consistent set of edits.
+        //
+        fgModified = false;
     }
 
-    fgUpdateFlowGraph(true);
-    fgReorderBlocks();
-    fgUpdateFlowGraph();
+    // optInvertWhileLoop can cause IR changes even if it does not modify
+    // the flow graph. It calls gtPrepareCost which can cause operand swapping.
+    // Work around this for now.
+    //
+    // Note phase status only impacts dumping and checking done post-phase,
+    // it has no impact on a release build.
+    //
+    madeChanges = true;
+
+    return madeChanges ? PhaseStatus::MODIFIED_EVERYTHING : PhaseStatus::MODIFIED_NOTHING;
 }
 
-/*****************************************************************************
- *
- *  Perform loop inversion, find and classify natural loops
- */
+//-----------------------------------------------------------------------------
+// optOptimizeLayout: reorder blocks to reduce cost of control flow
+//
+// Returns:
+//   suitable phase status
+//
+PhaseStatus Compiler::optOptimizeLayout()
+{
+    noway_assert(opts.OptimizationEnabled());
+    noway_assert(fgModified == false);
 
-void Compiler::optOptimizeLoops()
+    bool       madeChanges          = false;
+    const bool allowTailDuplication = true;
+
+    madeChanges |= fgUpdateFlowGraph(allowTailDuplication);
+    madeChanges |= fgReorderBlocks();
+    madeChanges |= fgUpdateFlowGraph();
+
+    // fgReorderBlocks can cause IR changes even if it does not modify
+    // the flow graph. It calls gtPrepareCost which can cause operand swapping.
+    // Work around this for now.
+    //
+    // Note phase status only impacts dumping and checking done post-phase,
+    // it has no impact on a release build.
+    //
+    madeChanges = true;
+
+    return madeChanges ? PhaseStatus::MODIFIED_EVERYTHING : PhaseStatus::MODIFIED_NOTHING;
+}
+
+//-----------------------------------------------------------------------------
+// optFindLoops: find and classify natural loops
+//
+// Notes:
+//  Also (re)sets all non-IBC block weights, and marks loops potentially needing
+//  alignment padding.
+//
+PhaseStatus Compiler::optFindLoops()
 {
     noway_assert(opts.OptimizationEnabled());
 
 #ifdef DEBUG
     if (verbose)
     {
-        printf("*************** In optOptimizeLoops()\n");
+        printf("*************** In optFindLoops()\n");
     }
 #endif
 
@@ -4452,7 +4585,7 @@ void Compiler::optOptimizeLoops()
             {
                 /* Is this a loop candidate? - We look for "back edges" */
 
-                BasicBlock* bottom = pred->flBlock;
+                BasicBlock* bottom = pred->getBlock();
 
                 /* is this a backward edge? (from BOTTOM to TOP) */
 
@@ -4508,6 +4641,10 @@ void Compiler::optOptimizeLoops()
             }
         }
 
+        // Check if any of the loops need alignment
+
+        optIdentifyLoopsForAlignment();
+
 #if COUNT_LOOPS
         totalUnnatLoopCount += loopNum;
 #endif
@@ -4523,9 +4660,13 @@ void Compiler::optOptimizeLoops()
                 printf("\n");
             }
         }
+
+        fgDebugCheckLoopTable();
 #endif
         optLoopsMarked = true;
     }
+
+    return PhaseStatus::MODIFIED_EVERYTHING;
 }
 
 //------------------------------------------------------------------------
@@ -5141,6 +5282,8 @@ void Compiler::optCloneLoops()
         printf("\nAfter loop cloning:\n");
         fgDispBasicBlocks(/*dumpTrees*/ true);
     }
+
+    fgDebugCheckLoopTable();
 #endif
 }
 
@@ -5148,9 +5291,10 @@ void Compiler::optCloneLoop(unsigned loopInd, LoopCloneContext* context)
 {
     assert(loopInd < optLoopCount);
 
-    JITDUMP("\nCloning loop %d: [h: %d, f: %d, t: %d, e: %d, b: %d].\n", loopInd, optLoopTable[loopInd].lpHead->bbNum,
-            optLoopTable[loopInd].lpFirst->bbNum, optLoopTable[loopInd].lpTop->bbNum,
-            optLoopTable[loopInd].lpEntry->bbNum, optLoopTable[loopInd].lpBottom->bbNum);
+    JITDUMP("\nCloning loop %d: [h: %d, f: %d, t: %d, e: %d, b: %d, c: %d].\n", loopInd,
+            optLoopTable[loopInd].lpHead->bbNum, optLoopTable[loopInd].lpFirst->bbNum,
+            optLoopTable[loopInd].lpTop->bbNum, optLoopTable[loopInd].lpEntry->bbNum,
+            optLoopTable[loopInd].lpBottom->bbNum, optLoopTable[loopInd].lpChild);
 
     // Determine the depth of the loop, so we can properly weight blocks added (outside the cloned loop blocks).
     unsigned             depth         = optLoopDepth(loopInd);
@@ -5265,6 +5409,18 @@ void Compiler::optCloneLoop(unsigned loopInd, LoopCloneContext* context)
         // checked them to guarantee they are clonable.
         bool cloneOk = BasicBlock::CloneBlockState(this, newBlk, blk);
         noway_assert(cloneOk);
+
+#if FEATURE_LOOP_ALIGN
+        // If the original loop is aligned, do not align the cloned loop because cloned loop will be executed in
+        // rare scenario. Additionally, having to align cloned loop will force us to disable some VEX prefix encoding
+        // and adding compensation for over-estimated instructions.
+        if (blk->isLoopAlign())
+        {
+            newBlk->bbFlags &= ~BBF_LOOP_ALIGN;
+            JITDUMP("Removing LOOP_ALIGN flag from cloned loop in " FMT_BB "\n", newBlk->bbNum);
+        }
+#endif
+
         // TODO-Cleanup: The above clones the bbNatLoopNum, which is incorrect.  Eventually, we should probably insert
         // the cloned loop in the loop table.  For now, however, we'll just make these blocks be part of the surrounding
         // loop, if one exists -- the parent of the loop we're cloning.
@@ -5452,7 +5608,7 @@ void Compiler::optEnsureUniqueHead(unsigned loopInd, BasicBlock::weight_t ambien
 
     for (flowList* predEntry = e->bbPreds; predEntry; predEntry = predEntry->flNext)
     {
-        BasicBlock* predBlock = predEntry->flBlock;
+        BasicBlock* predBlock = predEntry->getBlock();
 
         // Skip if predBlock is in the loop.
         if (t->bbNum <= predBlock->bbNum && predBlock->bbNum <= b->bbNum)
@@ -7101,7 +7257,7 @@ void Compiler::optHoistLoopBlocks(unsigned loopNum, ArrayStack<BasicBlock*>* blo
                         m_beforeSideEffect = false;
                     }
                 }
-                else if (tree->OperIs(GT_XADD, GT_XCHG, GT_LOCKADD, GT_CMPXCHG, GT_MEMORYBARRIER))
+                else if (tree->OperIs(GT_XADD, GT_XORR, GT_XAND, GT_XCHG, GT_LOCKADD, GT_CMPXCHG, GT_MEMORYBARRIER))
                 {
                     // If this node is a MEMORYBARRIER or an Atomic operation
                     // then don't hoist and stop any further hoisting after this node
@@ -7489,7 +7645,7 @@ void Compiler::fgCreateLoopPreHeader(unsigned lnum)
 
     for (flowList* pred = top->bbPreds; pred; pred = pred->flNext)
     {
-        BasicBlock* predBlock = pred->flBlock;
+        BasicBlock* predBlock = pred->getBlock();
 
         if (fgDominate(top, predBlock))
         {
@@ -7915,6 +8071,8 @@ bool Compiler::optComputeLoopSideEffectsOfBlock(BasicBlock* blk)
                         break;
 
                     case GT_LOCKADD:
+                    case GT_XORR:
+                    case GT_XAND:
                     case GT_XADD:
                     case GT_XCHG:
                     case GT_CMPXCHG:
@@ -7977,6 +8135,20 @@ bool Compiler::optComputeLoopSideEffectsOfBlock(BasicBlock* blk)
 // Marks the containsCall information to "lnum" and any parent loops.
 void Compiler::AddContainsCallAllContainingLoops(unsigned lnum)
 {
+
+#if FEATURE_LOOP_ALIGN
+    // If this is the inner most loop, reset the LOOP_ALIGN flag
+    // because a loop having call will not likely to benefit from
+    // alignment
+    if (optLoopTable[lnum].lpChild == BasicBlock::NOT_IN_LOOP)
+    {
+        BasicBlock* first = optLoopTable[lnum].lpFirst;
+        first->bbFlags &= ~BBF_LOOP_ALIGN;
+        JITDUMP("Removing LOOP_ALIGN flag for L%02u that starts at " FMT_BB " because loop has a call.\n", lnum,
+                first->bbNum);
+    }
+#endif
+
     assert(0 <= lnum && lnum < optLoopCount);
     while (lnum != BasicBlock::NOT_IN_LOOP)
     {
@@ -9390,35 +9562,38 @@ void Compiler::optRemoveRedundantZeroInits()
                             bool bbInALoop  = (block->bbFlags & BBF_BACKWARD_JUMP) != 0;
                             bool bbIsReturn = block->bbJumpKind == BBJ_RETURN;
 
-                            if (BitVecOps::IsMember(&bitVecTraits, zeroInitLocals, lclNum) ||
-                                (lclDsc->lvIsStructField &&
-                                 BitVecOps::IsMember(&bitVecTraits, zeroInitLocals, lclDsc->lvParentLcl)) ||
-                                (!lclDsc->lvTracked && !fgVarNeedsExplicitZeroInit(lclNum, bbInALoop, bbIsReturn)))
+                            if (!bbInALoop || bbIsReturn)
                             {
-                                // We are guaranteed to have a zero initialization in the prolog or a
-                                // dominating explicit zero initialization and the local hasn't been redefined
-                                // between the prolog and this explicit zero initialization so the assignment
-                                // can be safely removed.
-                                if (tree == stmt->GetRootNode())
+                                if (BitVecOps::IsMember(&bitVecTraits, zeroInitLocals, lclNum) ||
+                                    (lclDsc->lvIsStructField &&
+                                     BitVecOps::IsMember(&bitVecTraits, zeroInitLocals, lclDsc->lvParentLcl)) ||
+                                    (!lclDsc->lvTracked && !fgVarNeedsExplicitZeroInit(lclNum, bbInALoop, bbIsReturn)))
                                 {
-                                    fgRemoveStmt(block, stmt);
-                                    removedExplicitZeroInit      = true;
-                                    lclDsc->lvSuppressedZeroInit = 1;
-
-                                    if (lclDsc->lvTracked)
+                                    // We are guaranteed to have a zero initialization in the prolog or a
+                                    // dominating explicit zero initialization and the local hasn't been redefined
+                                    // between the prolog and this explicit zero initialization so the assignment
+                                    // can be safely removed.
+                                    if (tree == stmt->GetRootNode())
                                     {
-                                        removedTrackedDefs   = true;
-                                        unsigned* pDefsCount = defsInBlock.LookupPointer(lclNum);
-                                        *pDefsCount          = (*pDefsCount) - 1;
+                                        fgRemoveStmt(block, stmt);
+                                        removedExplicitZeroInit      = true;
+                                        lclDsc->lvSuppressedZeroInit = 1;
+
+                                        if (lclDsc->lvTracked)
+                                        {
+                                            removedTrackedDefs   = true;
+                                            unsigned* pDefsCount = defsInBlock.LookupPointer(lclNum);
+                                            *pDefsCount          = (*pDefsCount) - 1;
+                                        }
                                     }
                                 }
-                            }
 
-                            if (treeOp->gtOp1->OperIs(GT_LCL_VAR))
-                            {
-                                BitVecOps::AddElemD(&bitVecTraits, zeroInitLocals, lclNum);
+                                if (treeOp->gtOp1->OperIs(GT_LCL_VAR))
+                                {
+                                    BitVecOps::AddElemD(&bitVecTraits, zeroInitLocals, lclNum);
+                                }
+                                *pRefCount = 0;
                             }
-                            *pRefCount = 0;
                         }
 
                         if (!removedExplicitZeroInit && treeOp->gtOp1->OperIs(GT_LCL_VAR) &&

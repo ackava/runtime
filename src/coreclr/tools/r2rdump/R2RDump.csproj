@@ -5,7 +5,6 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <OutputType>Exe</OutputType>
     <Platforms>x64;x86;arm64;arm</Platforms>
-    <PlatformTarget>AnyCPU</PlatformTarget>
     <AssemblyKey>Open</AssemblyKey>
     <IsDotNetFrameworkProductAssembly>true</IsDotNetFrameworkProductAssembly>
     <TargetFramework>$(NetCoreAppToolCurrent)</TargetFramework>
@@ -22,6 +21,7 @@
     <PackageReference Include="System.CommandLine">
       <Version>$(SystemCommandLineVersion)</Version>
     </PackageReference>
+    <ProjectReference Include="..\aot\ILCompiler.Diagnostics\ILCompiler.Diagnostics.csproj" />
     <ProjectReference Include="..\aot\ILCompiler.Reflection.ReadyToRun\ILCompiler.Reflection.ReadyToRun.csproj" />
     <Content Include="$(CoreDisToolsLibrary)" Condition="Exists('$(CoreDisToolsLibrary)')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

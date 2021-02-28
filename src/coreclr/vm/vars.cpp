@@ -27,9 +27,9 @@ const char g_psBaseLibrary[]      = CoreLibName_IL_A;
 const char g_psBaseLibraryName[]  = CoreLibName_A;
 const char g_psBaseLibrarySatelliteAssemblyName[]  = CoreLibSatelliteName_A;
 
-Volatile<LONG>       g_TrapReturningThreads;
+Volatile<int32_t>       g_TrapReturningThreads;
 
-BBSweep              g_BBSweep;
+BBSweep                 g_BBSweep;
 
 #ifdef _DEBUG
 // next two variables are used to enforce an ASSERT in Thread::DbgFindThread
@@ -116,10 +116,7 @@ GVAL_IMPL_INIT(DWORD, g_TlsIndex, TLS_OUT_OF_INDEXES);
 OBJECTHANDLE         g_pPreallocatedOutOfMemoryException;
 OBJECTHANDLE         g_pPreallocatedStackOverflowException;
 OBJECTHANDLE         g_pPreallocatedExecutionEngineException;
-OBJECTHANDLE         g_pPreallocatedRudeThreadAbortException;
-OBJECTHANDLE         g_pPreallocatedThreadAbortException;
 OBJECTHANDLE         g_pPreallocatedSentinelObject;
-OBJECTHANDLE         g_pPreallocatedBaseException;
 
 //
 //

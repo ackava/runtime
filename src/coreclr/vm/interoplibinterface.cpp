@@ -18,13 +18,11 @@ using CreateComInterfaceFlags = InteropLib::Com::CreateComInterfaceFlags;
 namespace
 {
     // This class is used to track the external object within the runtime.
-    struct ExternalObjectContext
+    struct ExternalObjectContext : public InteropLibInterface::ExternalObjectContextBase
     {
         static const DWORD InvalidSyncBlockIndex;
 
-        void* Identity;
         void* ThreadContext;
-        DWORD SyncBlockIndex;
         INT64 WrapperId;
 
         enum
@@ -128,10 +126,6 @@ namespace
             return Key(Identity, WrapperId);
         }
     };
-
-    // Identity is used by the DAC, any changes to the layout must be updated on the DAC side (request.cpp)
-    static constexpr size_t DACIdentityOffset = 0;
-    static_assert(offsetof(ExternalObjectContext, Identity) == DACIdentityOffset, "Keep in sync with DAC interfaces");
 
     const DWORD ExternalObjectContext::InvalidSyncBlockIndex = 0; // See syncblk.h
 
@@ -442,7 +436,7 @@ namespace
     INT64 g_trackerSupportGlobalInstanceId = ComWrappersNative::InvalidWrapperId;
 
     // Defined handle types for the specific object uses.
-    const HandleType InstanceHandleType{ HNDTYPE_STRONG };
+    const HandleType InstanceHandleType{ HNDTYPE_REFCOUNTED };
 
     // Scenarios for ComWrappers usage.
     // These values should match the managed definition in ComWrappers.
@@ -655,19 +649,9 @@ namespace
         }
         else if (wrapperRawMaybe != NULL)
         {
-            // It is possible the supplied wrapper is no longer valid. If so, reactivate the
-            // wrapper using the protected OBJECTREF.
+            // AddRef() the existing wrapper.
             IUnknown* wrapper = static_cast<IUnknown*>(wrapperRawMaybe);
-            hr = InteropLib::Com::IsActiveWrapper(wrapper);
-            if (hr == S_FALSE)
-            {
-                STRESS_LOG1(LF_INTEROP, LL_INFO100, "Reactivating MOW: 0x%p\n", wrapperRawMaybe);
-                OBJECTHANDLE h = GetAppDomain()->CreateTypedHandle(gc.instRef, InstanceHandleType);
-                hr = InteropLib::Com::ReactivateWrapper(wrapper, static_cast<InteropLib::OBJECTHANDLE>(h));
-            }
-
-            if (FAILED(hr))
-                COMPlusThrowHR(hr);
+            (void)wrapper->AddRef();
         }
 
         GCPROTECT_END();
@@ -680,6 +664,7 @@ namespace
         _In_opt_ OBJECTREF impl,
         _In_ INT64 wrapperId,
         _In_ IUnknown* identity,
+        _In_opt_ IUnknown* inner,
         _In_ CreateObjectFlags flags,
         _In_ ComWrappersScenario scenario,
         _In_opt_ OBJECTREF wrapperMaybe,
@@ -725,10 +710,10 @@ namespace
             extObjCxt = cache->Find(cacheKey);
 
             // If is no object found in the cache, check if the object COM instance is actually the CCW
-            // representing a managed object. For the scenario of marshalling through a global instance,
-            // COM instances that are actually CCWs should be unwrapped to the original managed object
-            // to allow for round-tripping object -> COM instance -> object.
-            if (extObjCxt == NULL && scenario == ComWrappersScenario::MarshallingGlobalInstance)
+            // representing a managed object. If the user passed the Unwrap flag, COM instances that are
+            // actually CCWs should be unwrapped to the original managed object to allow for round
+            // tripping object -> COM instance -> object.
+            if (extObjCxt == NULL && (flags & CreateObjectFlags::CreateObjectFlags_Unwrap))
             {
                 // If the COM instance is a CCW that is not COM-activated, use the object of that wrapper object.
                 InteropLib::OBJECTHANDLE handleLocal;
@@ -760,6 +745,7 @@ namespace
                 GCX_PREEMP();
                 hr = InteropLib::Com::CreateWrapperForExternal(
                     identity,
+                    inner,
                     flags,
                     sizeof(ExternalObjectContext),
                     &resultHolder);
@@ -783,7 +769,7 @@ namespace
             if (gc.objRefMaybe != NULL)
             {
                 // Construct the new context with the object details.
-                DWORD flags = (resultHolder.Result.FromTrackerRuntime
+                DWORD eocFlags = (resultHolder.Result.FromTrackerRuntime
                                 ? ExternalObjectContext::Flags_ReferenceTracker
                                 : ExternalObjectContext::Flags_None) |
                             (uniqueInstance
@@ -795,7 +781,7 @@ namespace
                     GetCurrentCtxCookie(),
                     gc.objRefMaybe->GetSyncBlockIndex(),
                     wrapperId,
-                    flags);
+                    eocFlags);
 
                 if (uniqueInstance)
                 {
@@ -833,6 +819,18 @@ namespace
                     // Detach from the holder to avoid cleanup.
                     (void)resultHolder.DetachContext();
                     STRESS_LOG2(LF_INTEROP, LL_INFO100, "Created EOC (Unique Instance: %d): 0x%p\n", (int)uniqueInstance, extObjCxt);
+
+                    // If this is an aggregation scenario and the identity object
+                    // is a managed object wrapper, we need to call Release() to
+                    // indicate this external object isn't rooted. In the event the
+                    // object is passed out to native code an AddRef() must be called
+                    // based on COM convention and will "fix" the count.
+                    if (flags & CreateObjectFlags::CreateObjectFlags_Aggregated
+                        && resultHolder.Result.ManagedObjectWrapper)
+                    {
+                        (void)identity->Release();
+                        STRESS_LOG1(LF_INTEROP, LL_INFO100, "EOC aggregated with MOW: 0x%p\n", identity);
+                    }
                 }
 
                 _ASSERTE(extObjCxt->IsActive());
@@ -1086,6 +1084,7 @@ namespace InteropLibImports
                 gc.implRef,
                 g_trackerSupportGlobalInstanceId,
                 externalComObject,
+                NULL,
                 externalObjectFlags,
                 ComWrappersScenario::TrackerSupportGlobalInstance,
                 gc.wrapperMaybeRef,
@@ -1252,9 +1251,12 @@ namespace InteropLibImports
         ::OBJECTHANDLE objectHandle = static_cast<::OBJECTHANDLE>(handle);
         OBJECTREF target = ObjectFromHandle(objectHandle);
 
-        // If these point at the same object don't create a reference.
-        if (source->PassiveGetSyncBlock() == target->PassiveGetSyncBlock())
+        // Return if the target has been collected or these are the same object.
+        if (target == NULL
+            || source->PassiveGetSyncBlock() == target->PassiveGetSyncBlock())
+        {
             return S_FALSE;
+        }
 
         STRESS_LOG2(LF_INTEROP, LL_INFO1000, "Found reference path: 0x%p => 0x%p\n",
             OBJECTREFToObject(source),
@@ -1300,6 +1302,7 @@ BOOL QCALLTYPE ComWrappersNative::TryGetOrCreateObjectForComInstance(
     _In_ QCall::ObjectHandleOnStack comWrappersImpl,
     _In_ INT64 wrapperId,
     _In_ void* ext,
+    _In_opt_ void* innerMaybe,
     _In_ INT32 flags,
     _In_ QCall::ObjectHandleOnStack wrapperMaybe,
     _Inout_ QCall::ObjectHandleOnStack retValue)
@@ -1314,10 +1317,15 @@ BOOL QCALLTYPE ComWrappersNative::TryGetOrCreateObjectForComInstance(
 
     HRESULT hr;
     IUnknown* externalComObject = reinterpret_cast<IUnknown*>(ext);
+    IUnknown* inner = reinterpret_cast<IUnknown*>(innerMaybe);
 
-    // Determine the true identity of the object
+    // Determine the true identity and inner of the object
     SafeComHolder<IUnknown> identity;
-    hr = externalComObject->QueryInterface(IID_IUnknown, &identity);
+    hr = InteropLib::Com::DetermineIdentityAndInnerForExternal(
+        externalComObject,
+        (CreateObjectFlags)flags,
+        &identity,
+        &inner);
     _ASSERTE(hr == S_OK);
 
     // Switch to Cooperative mode since object references
@@ -1330,6 +1338,7 @@ BOOL QCALLTYPE ComWrappersNative::TryGetOrCreateObjectForComInstance(
             ObjectToOBJECTREF(*comWrappersImpl.m_ppObject),
             wrapperId,
             identity,
+            inner,
             (CreateObjectFlags)flags,
             ComWrappersScenario::Instance,
             ObjectToOBJECTREF(*wrapperMaybe.m_ppObject),
@@ -1368,6 +1377,7 @@ void ComWrappersNative::DestroyManagedObjectComWrapper(_In_ void* wrapper)
     CONTRACTL
     {
         NOTHROW;
+        GC_NOTRIGGER;
         MODE_ANY;
         PRECONDITION(wrapper != NULL);
     }
@@ -1382,6 +1392,7 @@ void ComWrappersNative::DestroyExternalComObjectContext(_In_ void* contextRaw)
     CONTRACTL
     {
         NOTHROW;
+        GC_NOTRIGGER;
         MODE_ANY;
         PRECONDITION(contextRaw != NULL);
     }
@@ -1456,6 +1467,13 @@ bool GlobalComWrappersForMarshalling::TryGetOrCreateComInterfaceForObject(
     _In_ OBJECTREF instance,
     _Outptr_ void** wrapperRaw)
 {
+    CONTRACTL
+    {
+        THROWS;
+        MODE_COOPERATIVE;
+    }
+    CONTRACTL_END;
+
     if (g_marshallingGlobalInstanceId == ComWrappersNative::InvalidWrapperId)
         return false;
 
@@ -1482,6 +1500,13 @@ bool GlobalComWrappersForMarshalling::TryGetOrCreateObjectForComInstance(
     _In_ INT32 objFromComIPFlags,
     _Out_ OBJECTREF* objRef)
 {
+    CONTRACTL
+    {
+        THROWS;
+        MODE_COOPERATIVE;
+    }
+    CONTRACTL_END;
+
     if (g_marshallingGlobalInstanceId == ComWrappersNative::InvalidWrapperId)
         return false;
 
@@ -1499,7 +1524,8 @@ bool GlobalComWrappersForMarshalling::TryGetOrCreateObjectForComInstance(
     {
         GCX_COOP();
 
-        int flags = CreateObjectFlags::CreateObjectFlags_TrackerObject;
+        // TrackerObject support and unwrapping matches the built-in semantics that the global marshalling scenario mimics.
+        int flags = CreateObjectFlags::CreateObjectFlags_TrackerObject | CreateObjectFlags::CreateObjectFlags_Unwrap;
         if ((objFromComIPFlags & ObjFromComIP::UNIQUE_OBJECT) != 0)
             flags |= CreateObjectFlags::CreateObjectFlags_UniqueInstance;
 
@@ -1508,6 +1534,7 @@ bool GlobalComWrappersForMarshalling::TryGetOrCreateObjectForComInstance(
             NULL /*comWrappersImpl*/,
             g_marshallingGlobalInstanceId,
             identity,
+            NULL,
             (CreateObjectFlags)flags,
             ComWrappersScenario::MarshallingGlobalInstance,
             NULL /*wrapperMaybe*/,
@@ -1581,6 +1608,7 @@ bool GlobalComWrappersForTrackerSupport::TryGetOrCreateObjectForComInstance(
         NULL /*comWrappersImpl*/,
         g_trackerSupportGlobalInstanceId,
         identity,
+        NULL,
         CreateObjectFlags::CreateObjectFlags_TrackerObject,
         ComWrappersScenario::TrackerSupportGlobalInstance,
         NULL /*wrapperMaybe*/,
@@ -1630,6 +1658,66 @@ IUnknown* ComWrappersNative::GetIdentityForObject(_In_ OBJECTREF* objectPROTECTE
         }
     }
     return nullptr;
+}
+
+namespace
+{
+    struct CallbackContext
+    {
+        bool HasWrapper;
+        bool IsRooted;
+    };
+    bool IsWrapperRootedCallback(_In_ void* mocw, _In_ void* cxtRaw)
+    {
+        CONTRACTL
+        {
+            NOTHROW;
+            GC_NOTRIGGER;
+            MODE_ANY;
+            PRECONDITION(mocw != NULL);
+            PRECONDITION(cxtRaw != NULL);
+        }
+        CONTRACTL_END;
+
+        auto cxt = static_cast<CallbackContext*>(cxtRaw);
+        cxt->HasWrapper = true;
+
+        IUnknown* wrapper = static_cast<IUnknown*>(mocw);
+        cxt->IsRooted = (InteropLib::Com::IsWrapperRooted(wrapper) == S_OK);
+
+        // If we find a single rooted wrapper then the managed object
+        // is considered rooted and we can stop enumerating.
+        if (cxt->IsRooted)
+            return false;
+
+        return true;
+    }
+}
+
+bool ComWrappersNative::HasManagedObjectComWrapper(_In_ OBJECTREF object, _Out_ bool* isRooted)
+{
+    CONTRACTL
+    {
+        NOTHROW;
+        GC_NOTRIGGER;
+        PRECONDITION(CheckPointer(isRooted));
+    }
+    CONTRACTL_END;
+
+    *isRooted = false;
+    SyncBlock* syncBlock = object->PassiveGetSyncBlock();
+    if (syncBlock == nullptr)
+        return false;
+
+    InteropSyncBlockInfo* interopInfo = syncBlock->GetInteropInfoNoCreate();
+    if (interopInfo == nullptr)
+        return false;
+
+    CallbackContext cxt{};
+    interopInfo->EnumManagedObjectComWrappers(&IsWrapperRootedCallback, &cxt);
+
+    *isRooted = cxt.IsRooted;
+    return cxt.HasWrapper;
 }
 
 #endif // FEATURE_COMWRAPPERS

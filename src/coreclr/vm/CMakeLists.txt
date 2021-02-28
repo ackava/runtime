@@ -29,6 +29,16 @@ if(FEATURE_JIT_PITCHING)
    add_definitions(-DFEATURE_JIT_PITCHING)
 endif(FEATURE_JIT_PITCHING)
 
+if(FEATURE_PERFTRACING)
+    set(SHARED_EVENTPIPE_DIR ${CLR_SRC_NATIVE_DIR}/eventpipe)
+    set(CORECLR_EVENTPIPE_SHIM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/eventing/eventpipe)
+endif(FEATURE_PERFTRACING)
+
+if(FEATURE_PERFTRACING)
+    include_directories(${SHARED_EVENTPIPE_DIR})
+    include_directories(${CORECLR_EVENTPIPE_SHIM_DIR})
+endif(FEATURE_PERFTRACING)
+
 set(VM_SOURCES_DAC_AND_WKS_COMMON
     appdomain.cpp
     array.cpp
@@ -59,7 +69,6 @@ set(VM_SOURCES_DAC_AND_WKS_COMMON
     disassembler.cpp
     dllimport.cpp
     domainfile.cpp
-    dumpdiagnosticprotocolhelper.cpp
     dynamicmethod.cpp
     ecall.cpp
     eedbginterfaceimpl.cpp
@@ -105,7 +114,6 @@ set(VM_SOURCES_DAC_AND_WKS_COMMON
     pinvokeoverride.cpp
     precode.cpp
     prestub.cpp
-    profilerdiagnosticprotocolhelper.cpp
     rejit.cpp
     sigformat.cpp
     siginfo.cpp
@@ -315,7 +323,6 @@ set(VM_SOURCES_WKS
     customattribute.cpp
     custommarshalerinfo.cpp
     autotrace.cpp
-    diagnosticserver.cpp
     dllimportcallback.cpp
     dynamicinterfacecastable.cpp
     eeconfig.cpp
@@ -323,27 +330,8 @@ set(VM_SOURCES_WKS
     eemessagebox.cpp
     eepolicy.cpp
     eetoprofinterfaceimpl.cpp
-    eventpipe.cpp
-    eventpipeconfiguration.cpp
-    eventpipeevent.cpp
-    eventpipeeventinstance.cpp
-    eventpipeeventpayload.cpp
-    eventpipeeventsource.cpp
-    eventpipeblock.cpp
-    eventpipecommontypes.cpp
-    eventpipefile.cpp
     eventpipeinternal.cpp
-    eventpipejsonfile.cpp
-    eventpipemetadatagenerator.cpp
-    eventpipeprotocolhelper.cpp
-    eventpipeprovider.cpp
-    eventpipethread.cpp
-    eventpipebuffer.cpp
-    eventpipebuffermanager.cpp
-    eventpipesession.cpp
-    eventpipesessionprovider.cpp
     eventstore.cpp
-    fastserializer.cpp
     fcall.cpp
     fieldmarshaler.cpp
     finalizerthread.cpp
@@ -361,7 +349,6 @@ set(VM_SOURCES_WKS
     interoputil.cpp
     interpreter.cpp
     invokeutil.cpp
-    ipcstreamfactory.cpp
     jithelpers.cpp
     managedmdimport.cpp
     marshalnative.cpp
@@ -375,7 +362,6 @@ set(VM_SOURCES_WKS
     objectlist.cpp
     olevariant.cpp
     pendingload.cpp
-    processdiagnosticsprotocolhelper.cpp
     profdetach.cpp
     profilermetadataemitvalidator.cpp
     profilingenumerators.cpp
@@ -386,7 +372,6 @@ set(VM_SOURCES_WKS
     reflectioninvocation.cpp
     runtimehandles.cpp
     safehandle.cpp
-    sampleprofiler.cpp
     simplerwlock.cpp
     sourceline.cpp
     stackingallocator.cpp
@@ -436,8 +421,7 @@ set(VM_HEADERS_WKS
     customattribute.h
     custommarshalerinfo.h
     autotrace.h
-    diagnosticserver.h
-    diagnosticsprotocol.h
+    diagnosticserveradapter.h
     dllimportcallback.h
     eeconfig.h
     eecontract.h
@@ -447,26 +431,10 @@ set(VM_HEADERS_WKS
     eeprofinterfaces.inl
     eetoprofinterfaceimpl.h
     eetoprofinterfaceimpl.inl
-    eventpipe.h
-    eventpipeblock.h
-    eventpipebuffer.h
-    eventpipebuffermanager.h
-    eventpipecommontypes.h
-    eventpipeconfiguration.h
-    eventpipeevent.h
-    eventpipeeventinstance.h
-    eventpipeeventpayload.h
-    eventpipeeventsource.h
-    eventpipefile.h
+    eventpipeadapter.h
+    eventpipeadaptertypes.h
     eventpipeinternal.h
-    eventpipejsonfile.h
-    eventpipemetadatagenerator.h
-    eventpipeprotocolhelper.h
-    eventpipeprovider.h
-    eventpipesession.h
-    eventpipesessionprovider.h
     eventstore.hpp
-    fastserializer.h
     fcall.h
     fieldmarshaler.h
     finalizerthread.h
@@ -482,7 +450,6 @@ set(VM_HEADERS_WKS
     interpreter.h
     interpreter.hpp
     invokeutil.h
-    ipcstreamfactory.h
     managedmdimport.hpp
     marshalnative.h
     methodtablebuilder.h
@@ -496,7 +463,6 @@ set(VM_HEADERS_WKS
     objectlist.h
     olevariant.h
     pendingload.h
-    processdiagnosticsprotocolhelper.h
     profdetach.h
     profilermetadataemitvalidator.h
     profilingenumerators.h
@@ -507,10 +473,8 @@ set(VM_HEADERS_WKS
     reflectclasswriter.h
     reflectioninvocation.h
     runtimehandles.h
-    sampleprofiler.h
     simplerwlock.hpp
     sourceline.h
-    stackcontents.h
     stackingallocator.h
     stringliteralmap.h
     stubcache.h
@@ -795,7 +759,6 @@ if(CLR_CMAKE_TARGET_ARCH_AMD64)
     )
 elseif(CLR_CMAKE_TARGET_ARCH_I386)
     set(VM_SOURCES_DAC_AND_WKS_ARCH
-        gcdecode.cpp
         exinfo.cpp
         ${ARCH_SOURCES_DIR}/cgenx86.cpp
         ${ARCH_SOURCES_DIR}/excepx86.cpp
@@ -924,11 +887,22 @@ if (CLR_CMAKE_TARGET_WIN32)
     list(APPEND VM_SOURCES_DAC ${VM_HEADERS_DAC})
 endif(CLR_CMAKE_TARGET_WIN32)
 
-#these two files we need to compile differently for standalone and mergeable flavors of WKS
+# these two files we need to compile differently for standalone and mergeable flavors of WKS
 set (VM_SOURCES_WKS_SPECIAL
     codeman.cpp
     ceemain.cpp
 )
+
+# gcdecode.cpp is included by both JIT and VM. to avoid duplicate definitions we need to
+# treat it in a special way when statically linking with both VM and JIT
+if(CLR_CMAKE_TARGET_ARCH_I386)
+    list(APPEND VM_SOURCES_DAC
+        gcdecode.cpp
+    )
+    list(APPEND VM_SOURCES_WKS_SPECIAL
+        gcdecode.cpp
+    )
+endif()
 
 convert_to_absolute_path(VM_SOURCES_WKS ${VM_SOURCES_WKS})
 convert_to_absolute_path(VM_SOURCES_WKS_ARCH_ASM ${VM_SOURCES_WKS_ARCH_ASM})

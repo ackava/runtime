@@ -287,6 +287,8 @@ void Compiler::fgPerNodeLocalVarLiveness(GenTree* tree)
 
         // We'll assume these are use-then-defs of memory.
         case GT_LOCKADD:
+        case GT_XORR:
+        case GT_XAND:
         case GT_XADD:
         case GT_XCHG:
         case GT_CMPXCHG:
@@ -299,6 +301,19 @@ void Compiler::fgPerNodeLocalVarLiveness(GenTree* tree)
             // Simliar to any Volatile indirection, we must handle this as a definition of GcHeap/ByrefExposed
             fgCurMemoryDef |= memoryKindSet(GcHeap, ByrefExposed);
             break;
+
+#ifdef FEATURE_SIMD
+        case GT_SIMD:
+        {
+            GenTreeSIMD* simdNode = tree->AsSIMD();
+            if (simdNode->OperIsMemoryLoad())
+            {
+                // This instruction loads from memory and we need to record this information
+                fgCurMemoryUse |= memoryKindSet(GcHeap, ByrefExposed);
+            }
+            break;
+        }
+#endif // FEATURE_SIMD
 
 #ifdef FEATURE_HW_INTRINSICS
         case GT_HWINTRINSIC:
@@ -319,7 +334,7 @@ void Compiler::fgPerNodeLocalVarLiveness(GenTree* tree)
             }
             break;
         }
-#endif
+#endif // FEATURE_HW_INTRINSICS
 
         // For now, all calls read/write GcHeap/ByrefExposed, writes in their entirety.  Might tighten this case later.
         case GT_CALL:
@@ -2039,6 +2054,8 @@ void Compiler::fgComputeLifeLIR(VARSET_TP& life, BasicBlock* block, VARSET_VALAR
                 break;
 
             case GT_LOCKADD:
+            case GT_XORR:
+            case GT_XAND:
             case GT_XADD:
             case GT_XCHG:
             case GT_CMPXCHG:

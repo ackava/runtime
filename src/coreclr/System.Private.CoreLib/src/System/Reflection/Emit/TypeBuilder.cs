@@ -51,7 +51,7 @@ namespace System.Reflection.Emit
                 {
                     Debug.Assert(m_con != null);
                     DefineCustomAttribute(module, token, module.GetConstructorToken(m_con),
-                        m_binaryAttribute, false, false);
+                        m_binaryAttribute);
                 }
                 else
                 {
@@ -62,6 +62,8 @@ namespace System.Reflection.Emit
         #endregion
 
         #region Public Static Methods
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2055:UnrecognizedReflectionPattern",
+            Justification = "MakeGenericType is only called on a TypeBuilder which is not subject to trimming")]
         public static MethodInfo GetMethod(Type type, MethodInfo method)
         {
             if (!(type is TypeBuilder) && !(type is TypeBuilderInstantiation))
@@ -94,6 +96,9 @@ namespace System.Reflection.Emit
 
             return MethodOnTypeBuilderInstantiation.GetMethod(method, (type as TypeBuilderInstantiation)!);
         }
+
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2055:UnrecognizedReflectionPattern",
+            Justification = "MakeGenericType is only called on a TypeBuilder which is not subject to trimming")]
         public static ConstructorInfo GetConstructor(Type type, ConstructorInfo constructor)
         {
             if (!(type is TypeBuilder) && !(type is TypeBuilderInstantiation))
@@ -114,6 +119,9 @@ namespace System.Reflection.Emit
 
             return ConstructorOnTypeBuilderInstantiation.GetConstructor(constructor, (type as TypeBuilderInstantiation)!);
         }
+
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2055:UnrecognizedReflectionPattern",
+            Justification = "MakeGenericType is only called on a TypeBuilder which is not subject to trimming")]
         public static FieldInfo GetField(Type type, FieldInfo field)
         {
             if (!(type is TypeBuilder) && !(type is TypeBuilderInstantiation))
@@ -170,10 +178,10 @@ namespace System.Reflection.Emit
 
         [DllImport(RuntimeHelpers.QCall, CharSet = CharSet.Unicode)]
         private static extern void DefineCustomAttribute(QCallModule module, int tkAssociate, int tkConstructor,
-            byte[]? attr, int attrLength, bool toDisk, bool updateCompilerFlags);
+            byte[]? attr, int attrLength);
 
         internal static void DefineCustomAttribute(ModuleBuilder module, int tkAssociate, int tkConstructor,
-            byte[]? attr, bool toDisk, bool updateCompilerFlags)
+            byte[]? attr)
         {
             byte[]? localAttr = null;
 
@@ -184,7 +192,7 @@ namespace System.Reflection.Emit
             }
 
             DefineCustomAttribute(new QCallModule(ref module), tkAssociate, tkConstructor,
-                localAttr, (localAttr != null) ? localAttr.Length : 0, toDisk, updateCompilerFlags);
+                localAttr, (localAttr != null) ? localAttr.Length : 0);
         }
 
         [DllImport(RuntimeHelpers.QCall, CharSet = CharSet.Unicode)]
@@ -1265,6 +1273,8 @@ namespace System.Reflection.Emit
             }
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2082:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
         private MethodBuilder DefineMethodNoLock(string name, MethodAttributes attributes, CallingConventions callingConvention,
             Type? returnType, Type[]? returnTypeRequiredCustomModifiers, Type[]? returnTypeOptionalCustomModifiers,
             Type[]? parameterTypes, Type[][]? parameterTypeRequiredCustomModifiers, Type[][]? parameterTypeOptionalCustomModifiers)
@@ -1344,6 +1354,8 @@ namespace System.Reflection.Emit
             return method;
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2082:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
         private MethodBuilder DefinePInvokeMethodHelper(
             string name, string dllName, string importName, MethodAttributes attributes, CallingConventions callingConvention,
             Type? returnType, Type[]? returnTypeRequiredCustomModifiers, Type[]? returnTypeOptionalCustomModifiers,
@@ -1459,6 +1471,8 @@ namespace System.Reflection.Emit
             }
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2082:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
         private ConstructorBuilder DefineTypeInitializerNoLock()
         {
             ThrowIfCreated();
@@ -1485,6 +1499,10 @@ namespace System.Reflection.Emit
             }
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2055:UnrecognizedReflectionPattern",
+            Justification = "MakeGenericType is only called on a TypeBuilderInstantiation which is not subject to trimming")]
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2075:UnrecognizedReflectionPattern",
+            Justification = "GetConstructor is only called on a TypeBuilderInstantiation which is not subject to trimming")]
         private ConstructorBuilder DefineDefaultConstructorNoLock(MethodAttributes attributes)
         {
             ConstructorBuilder constBuilder;
@@ -1558,6 +1576,8 @@ namespace System.Reflection.Emit
             }
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2082:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
         private ConstructorBuilder DefineConstructorNoLock(MethodAttributes attributes, CallingConventions callingConvention,
             Type[]? parameterTypes, Type[][]? requiredCustomModifiers, Type[][]? optionalCustomModifiers)
         {
@@ -1861,6 +1881,7 @@ namespace System.Reflection.Emit
 
         #region Create Type
 
+        [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
         public TypeInfo? CreateTypeInfo()
         {
             lock (SyncRoot)
@@ -1869,6 +1890,7 @@ namespace System.Reflection.Emit
             }
         }
 
+        [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
         public Type? CreateType()
         {
             lock (SyncRoot)
@@ -1877,6 +1899,9 @@ namespace System.Reflection.Emit
             }
         }
 
+        [UnconditionalSuppressMessage("ReflectionAnalysis", "IL2083:UnrecognizedReflectionPattern",
+            Justification = "Reflection.Emit is not subject to trimming")]
+        [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
         private TypeInfo? CreateTypeNoLock()
         {
             if (IsCreated())
@@ -2134,7 +2159,7 @@ namespace System.Reflection.Emit
                 throw new ArgumentNullException(nameof(binaryAttribute));
 
             DefineCustomAttribute(m_module, m_tdType, ((ModuleBuilder)m_module).GetConstructorToken(con),
-                binaryAttribute, false, false);
+                binaryAttribute);
         }
 
         public void SetCustomAttribute(CustomAttributeBuilder customBuilder)

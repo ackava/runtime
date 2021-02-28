@@ -34,15 +34,6 @@ HRESULT Assembler::InitMetaData()
     if (FAILED(hr))
         goto exit;
 
-    if(m_wzMetadataVersion)
-    {
-        VARIANT encOption;
-        BSTR    bstr;
-        V_VT(&encOption) = VT_BSTR;
-        V_BSTR(&encOption) = bstr = ::SysAllocString(m_wzMetadataVersion);
-        hr = m_pDisp->SetOption(MetaDataRuntimeVersion, &encOption);
-        ::SysFreeString(bstr);
-    }
     hr = m_pDisp->DefineScope(CLSID_CorMetaDataRuntime, 0, IID_IMetaDataEmit3,
                         (IUnknown **)&m_pEmitter);
     if (FAILED(hr))
@@ -52,7 +43,7 @@ HRESULT Assembler::InitMetaData()
     if(FAILED(hr = m_pEmitter->QueryInterface(IID_IMetaDataImport2, (void**)&m_pImporter)))
         goto exit;
 
-    if (m_pdbFormat == PdbFormat::PORTABLE)
+    if (m_fGeneratePDB)
     {
         m_pPortablePdbWriter = new PortablePdbWriter();
         if (FAILED(hr = m_pPortablePdbWriter->Init(m_pDisp))) goto exit;
@@ -209,7 +200,7 @@ HRESULT Assembler::CreateDebugDirectory()
     ULONG deOffset;
 
     // Only emit this if we're also emitting debug info.
-    if (!(m_fGeneratePDB && (m_pSymWriter || IsPortablePdb())))
+    if (!m_fGeneratePDB)
         return S_OK;
 
     IMAGE_DEBUG_DIRECTORY  debugDirIDD;
@@ -220,80 +211,42 @@ HRESULT Assembler::CreateDebugDirectory()
     } param;
     param.debugDirData = NULL;
 
-    if (m_pSymWriter)   // CLASSIC
-    {
-        // Get the debug info from the symbol writer.
-        if (FAILED(hr=m_pSymWriter->GetDebugInfo(NULL, 0, &param.debugDirDataSize, NULL)))
-            return hr;
+    // get module ID
+    DWORD rsds = 0x53445352;
+    DWORD pdbAge = 0x1;
+    DWORD len = sizeof(rsds) + sizeof(GUID) + sizeof(pdbAge) + (DWORD)strlen(m_szPdbFileName) + 1;
+    BYTE* dbgDirData = new BYTE[len];
 
-        // Will there even be any?
-        if (param.debugDirDataSize == 0)
-            return S_OK;
+    DWORD offset = 0;
+    memcpy_s(dbgDirData + offset, len, &rsds, sizeof(rsds));                            // RSDS
+    offset += sizeof(rsds);
+    memcpy_s(dbgDirData + offset, len, m_pPortablePdbWriter->GetGuid(), sizeof(GUID)); // PDB GUID
+    offset += sizeof(GUID);
+    memcpy_s(dbgDirData + offset, len, &pdbAge, sizeof(pdbAge));                        // PDB AGE
+    offset += sizeof(pdbAge);
+    memcpy_s(dbgDirData + offset, len, m_szPdbFileName, strlen(m_szPdbFileName) + 1);   // PDB PATH
 
-        // Make some room for the data.
-        PAL_TRY(Param *, pParam, &param) {
-            pParam->debugDirData = new BYTE[pParam->debugDirDataSize];
-        } PAL_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-            hr = E_FAIL;
-        } PAL_ENDTRY
+    debugDirIDD.Characteristics = 0;
+    debugDirIDD.TimeDateStamp = m_pPortablePdbWriter->GetTimestamp();
+    debugDirIDD.MajorVersion = 0x100;
+    debugDirIDD.MinorVersion = 0x504d;
+    debugDirIDD.Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+    debugDirIDD.SizeOfData = len;
+    debugDirIDD.AddressOfRawData = 0; // will be updated bellow
+    debugDirIDD.PointerToRawData = 0; // will be updated bellow
 
-        if(FAILED(hr)) return hr;
-        // Actually get the data now.
-        if (FAILED(hr = m_pSymWriter->GetDebugInfo(&debugDirIDD,
-                                                   param.debugDirDataSize,
-                                                   NULL,
-                                                   param.debugDirData)))
-            goto ErrExit;
+    param.debugDirDataSize = len;
 
-        // Grab the timestamp of the PE file.
-        DWORD fileTimeStamp;
+    // Make some room for the data.
+    PAL_TRY(Param*, pParam, &param) {
+        pParam->debugDirData = new BYTE[pParam->debugDirDataSize];
+    } PAL_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
+        hr = E_FAIL;
+    } PAL_ENDTRY
 
-        if (FAILED(hr = m_pCeeFileGen->GetFileTimeStamp(m_pCeeFile,
-                                                        &fileTimeStamp)))
-            goto ErrExit;
+    if (FAILED(hr)) return hr;
 
-        // Fill in the directory entry.
-        debugDirIDD.TimeDateStamp = VAL32(fileTimeStamp);
-    }
-    else if (IsPortablePdb())   // PORTABLE
-    {
-        // get module ID
-        DWORD rsds = 0x53445352;
-        DWORD pdbAge = 0x1;
-        DWORD len = sizeof(rsds) + sizeof(GUID) + sizeof(pdbAge) + (DWORD)strlen(m_szPdbFileName) + 1;
-        BYTE* dbgDirData = new BYTE[len];
-
-        DWORD offset = 0;
-        memcpy_s(dbgDirData + offset, len, &rsds, sizeof(rsds));                            // RSDS
-        offset += sizeof(rsds);
-        memcpy_s(dbgDirData + offset, len, m_pPortablePdbWriter->GetGuid(), sizeof(GUID)); // PDB GUID
-        offset += sizeof(GUID);
-        memcpy_s(dbgDirData + offset, len, &pdbAge, sizeof(pdbAge));                        // PDB AGE
-        offset += sizeof(pdbAge);
-        memcpy_s(dbgDirData + offset, len, m_szPdbFileName, strlen(m_szPdbFileName) + 1);   // PDB PATH
-
-        debugDirIDD.Characteristics = 0;
-        debugDirIDD.TimeDateStamp = m_pPortablePdbWriter->GetTimestamp();
-        debugDirIDD.MajorVersion = 0x100;
-        debugDirIDD.MinorVersion = 0x504d;
-        debugDirIDD.Type = IMAGE_DEBUG_TYPE_CODEVIEW;
-        debugDirIDD.SizeOfData = len;
-        debugDirIDD.AddressOfRawData = 0; // will be updated bellow
-        debugDirIDD.PointerToRawData = 0; // will be updated bellow
-
-        param.debugDirDataSize = len;
-
-        // Make some room for the data.
-        PAL_TRY(Param*, pParam, &param) {
-            pParam->debugDirData = new BYTE[pParam->debugDirDataSize];
-        } PAL_EXCEPT(EXCEPTION_EXECUTE_HANDLER) {
-            hr = E_FAIL;
-        } PAL_ENDTRY
-
-        if (FAILED(hr)) return hr;
-
-        param.debugDirData = dbgDirData;
-    }
+    param.debugDirData = dbgDirData;
 
     // Grab memory in the section for our stuff.
     // Note that UpdateResource doesn't work correctly if the debug directory is
@@ -912,8 +865,6 @@ HRESULT Assembler::DoLocalMemberRefFixups()
         int i;
         for(i = 0; (pMRF = m_LocalMemberRefFixupList.PEEK(i)) != NULL; i++)
         {
-            if(m_fENCMode && (!pMRF->m_fNew)) continue;
-
             switch(TypeFromToken(pMRF->tk))
             {
                 case 0x99000000: pList = &m_LocalMethodRefDList; break;
@@ -1084,6 +1035,9 @@ HRESULT Assembler::CreatePEFile(__in __nullterminated WCHAR *pwzOutputFilename)
         {
             goto exit;
         }
+
+        // Public-sign by default
+        m_dwComImageFlags |= COMIMAGE_FLAGS_STRONGNAMESIGNED;
     }
 
     if(bClock) bClock->cMDEmit2 = GetTickCount();
@@ -1437,32 +1391,23 @@ HRESULT Assembler::CreatePEFile(__in __nullterminated WCHAR *pwzOutputFilename)
         if (m_dwCeeFileFlags & ICEE_CREATE_MACHINE_I386)
             COR_SET_32BIT_REQUIRED(m_dwComImageFlags);
     }
-    if (m_fWindowsCE)
+
+    if (m_dwCeeFileFlags & ICEE_CREATE_MACHINE_ARM || m_fAppContainer)
     {
-        if (FAILED(hr=m_pCeeFileGen->SetSubsystem(m_pCeeFile, IMAGE_SUBSYSTEM_WINDOWS_CE_GUI, 2, 10))) goto exit;
-
-        if (FAILED(hr=m_pCeeFileGen->SetImageBase(m_pCeeFile, 0x10000))) goto exit;
+        // For AppContainer and ARM, you must have a minimum subsystem version of 6.02
+        m_wSSVersionMajor = (m_wSSVersionMajor < 6) ? 6 : m_wSSVersionMajor;
+        m_wSSVersionMinor = (m_wSSVersionMinor < 2 && m_wSSVersionMajor <= 6) ? 2 : m_wSSVersionMinor;
     }
-    else
-    {
-        if (m_dwCeeFileFlags & ICEE_CREATE_MACHINE_ARM || m_fAppContainer)
-        {
-            // For AppContainer and ARM, you must have a minimum subsystem version of 6.02
-            m_wSSVersionMajor = (m_wSSVersionMajor < 6) ? 6 : m_wSSVersionMajor;
-            m_wSSVersionMinor = (m_wSSVersionMinor < 2 && m_wSSVersionMajor <= 6) ? 2 : m_wSSVersionMinor;
 
-        }
+    // Default the subsystem, instead the user doesn't set it to GUI or CUI
+    if (m_dwSubsystem == (DWORD)-1)
+        // The default for ILAsm previously was CUI, so that should be the default behavior...
+        m_dwSubsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
 
-        // Default the subsystem, instead the user doesn't set it to GUI or CUI
-        if (m_dwSubsystem == (DWORD)-1)
-            // The default for ILAsm previously was CUI, so that should be the default behavior...
-            m_dwSubsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
-
-        if (FAILED(hr=m_pCeeFileGen->SetSubsystem(m_pCeeFile, m_dwSubsystem, m_wSSVersionMajor, m_wSSVersionMinor))) goto exit;
-    }
+    if (FAILED(hr=m_pCeeFileGen->SetSubsystem(m_pCeeFile, m_dwSubsystem, m_wSSVersionMajor, m_wSSVersionMinor))) goto exit;
 
     if (FAILED(hr=m_pCeeFileGen->ClearComImageFlags(m_pCeeFile, COMIMAGE_FLAGS_ILONLY))) goto exit;
-    if (FAILED(hr=m_pCeeFileGen->SetComImageFlags(m_pCeeFile, m_dwComImageFlags & ~COMIMAGE_FLAGS_STRONGNAMESIGNED))) goto exit;
+    if (FAILED(hr=m_pCeeFileGen->SetComImageFlags(m_pCeeFile, m_dwComImageFlags))) goto exit;
 
     if(m_dwFileAlignment)
     {
@@ -1640,18 +1585,6 @@ HRESULT Assembler::CreatePEFile(__in __nullterminated WCHAR *pwzOutputFilename)
             goto exit;
         }
     }
-    /*
-    if((m_wRTVmajor < 0xFFFF)&&(m_wRTVminor < 0xFFFF))
-    {
-        IMAGE_COR20_HEADER* pCorH;
-        if(FAILED(hr=m_pCeeFileGen->GetCorHeader(m_pCeeFile,&pCorH))) goto exit;
-        pCorH->MajorRuntimeVersion = VAL16(m_wRTVmajor);
-        pCorH->MinorRuntimeVersion = VAL16(m_wRTVminor);
-    }
-    */
-    // Generate the file -- moved to main
-    //if (FAILED(hr=m_pCeeFileGen->GenerateCeeFile(m_pCeeFile))) goto exit;
-
 
     hr = S_OK;
 

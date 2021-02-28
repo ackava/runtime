@@ -37,6 +37,7 @@ namespace System
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern bool IsInstanceOfType(RuntimeType type, [NotNullWhen(true)] object? o);
 
+        [RequiresUnreferencedCode("MakeGenericType cannot be statically analyzed. It's not possible to guarantee the availability of requirements of the generic type.")]
         internal static Type GetTypeHelper(Type typeStart, Type[]? genericArgs, IntPtr pModifiers, int cModifiers)
         {
             Type type = typeStart;
@@ -1245,7 +1246,7 @@ namespace System
             return m_ptr != null ? m_ptr.GetHashCode() : 0;
         }
 
-        public override bool Equals(object? obj)
+        public override bool Equals([NotNullWhen(true)] object? obj)
         {
             if (!(obj is ModuleHandle))
                 return false;

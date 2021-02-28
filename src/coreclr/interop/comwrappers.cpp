@@ -2,7 +2,6 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 #include "comwrappers.hpp"
-#include <interoplibabi.h>
 #include <interoplibimports.h>
 
 #include <new> // placement new
@@ -223,12 +222,10 @@ namespace
 namespace
 {
     const int32_t TrackerRefShift = 32;
-    const ULONGLONG TrackerRefCounter = ULONGLONG{ 1 } << TrackerRefShift;
-    const ULONGLONG ComRefCounter     = ULONGLONG{ 1 };
-    const ULONGLONG TrackerRefZero      = 0x0000000080000000;
+    const ULONGLONG TrackerRefCounter   = ULONGLONG{ 1 } << TrackerRefShift;
+    const ULONGLONG DestroySentinel     = 0x0000000080000000;
     const ULONGLONG TrackerRefCountMask = 0xffffffff00000000;
     const ULONGLONG ComRefCountMask     = 0x000000007fffffff;
-    const ULONGLONG RefCountMask        = 0xffffffff7fffffff;
 
     constexpr ULONG GetTrackerCount(_In_ ULONGLONG c)
     {
@@ -419,11 +416,29 @@ HRESULT ManagedObjectWrapper::Create(
 void ManagedObjectWrapper::Destroy(_In_ ManagedObjectWrapper* wrapper)
 {
     _ASSERTE(wrapper != nullptr);
+    _ASSERTE(GetComCount(wrapper->_refCount) == 0);
 
-    // Manually trigger the destructor since placement
-    // new was used to allocate the object.
-    wrapper->~ManagedObjectWrapper();
-    InteropLibImports::MemFree(wrapper, AllocScenario::ManagedObjectWrapper);
+    // Attempt to set the destroyed bit.
+    LONGLONG refCount;
+    LONGLONG prev;
+    do
+    {
+        prev = wrapper->_refCount;
+        refCount = prev | DestroySentinel;
+    } while (::InterlockedCompareExchange64(&wrapper->_refCount, refCount, prev) != prev);
+
+    // The destroy sentinel represents the bit that indicates the wrapper
+    // should be destroyed. Since the reference count field (64-bit) holds
+    // two counters we rely on the singular sentinal value - no other bits
+    // in the 64-bit counter are set. If there are outstanding bits set it
+    // indicates there are still outstanding references.
+    if (refCount == DestroySentinel)
+    {
+        // Manually trigger the destructor since placement
+        // new was used to allocate the object.
+        wrapper->~ManagedObjectWrapper();
+        InteropLibImports::MemFree(wrapper, AllocScenario::ManagedObjectWrapper);
+    }
 }
 
 ManagedObjectWrapper::ManagedObjectWrapper(
@@ -435,12 +450,12 @@ ManagedObjectWrapper::ManagedObjectWrapper(
     _In_ const ABI::ComInterfaceEntry* userDefined,
     _In_ ABI::ComInterfaceDispatch* dispatches)
     : Target{ nullptr }
+    , _refCount{ 1 }
     , _runtimeDefinedCount{ runtimeDefinedCount }
     , _userDefinedCount{ userDefinedCount }
     , _runtimeDefined{ runtimeDefined }
     , _userDefined{ userDefined }
     , _dispatches{ dispatches }
-    , _refCount{ 1 }
     , _flags{ flags }
 {
     bool wasSet = TrySetObjectHandle(objectHandle);
@@ -449,48 +464,9 @@ ManagedObjectWrapper::ManagedObjectWrapper(
 
 ManagedObjectWrapper::~ManagedObjectWrapper()
 {
-    // If the target isn't null, then a managed object
-    // is going to leak.
-    _ASSERTE(Target == nullptr);
-}
-
-ULONGLONG ManagedObjectWrapper::UniversalRelease(_In_ ULONGLONG dec)
-{
-    OBJECTHANDLE local = Target;
-
-    LONGLONG refCount;
-    if (dec == ComRefCounter)
-    {
-        _ASSERTE(dec == 1);
-        refCount = ::InterlockedDecrement64(&_refCount);
-    }
-    else
-    {
-        _ASSERTE(dec == TrackerRefCounter);
-        LONGLONG prev;
-        do
-        {
-            prev = _refCount;
-            refCount = prev - dec;
-        } while (::InterlockedCompareExchange64(&_refCount, refCount, prev) != prev);
-    }
-
-    // It is possible that a target wasn't set during an
-    // attempt to reactive the wrapper.
-    if ((RefCountMask & refCount) == 0 && local != nullptr)
-    {
-        _ASSERTE(!IsSet(CreateComInterfaceFlagsEx::IsPegged));
-        _ASSERTE(refCount == TrackerRefZero || refCount == 0);
-
-        // Attempt to reset the target if its current value is the same.
-        // It is possible the wrapper is in the middle of being reactivated.
-        (void)TrySetObjectHandle(nullptr, local);
-
-        // Tell the runtime to delete the managed object instance handle.
-        InteropLibImports::DeleteObjectInstanceHandle(local);
-    }
-
-    return refCount;
+    // If the target isn't null, then release it.
+    if (Target != nullptr)
+        InteropLibImports::DeleteObjectInstanceHandle(Target);
 }
 
 void* ManagedObjectWrapper::AsRuntimeDefined(_In_ REFIID riid)
@@ -551,16 +527,18 @@ void ManagedObjectWrapper::ResetFlag(_In_ CreateComInterfaceFlagsEx flag)
     ::InterlockedAnd((LONG*)&_flags, resetMask);
 }
 
-ULONG ManagedObjectWrapper::IsActiveAddRef()
+bool ManagedObjectWrapper::IsRooted() const
 {
-    ULONG count = GetComCount(::InterlockedIncrement64(&_refCount));
-    if (count == 1)
+    bool rooted = GetComCount(_refCount) > 0;
+    if (!rooted)
     {
-        // Ensure the current target is null.
-        ::InterlockedExchangePointer(&Target, nullptr);
+        // Only consider tracker ref count to be a "strong" ref count if it is pegged and alive.
+        rooted = (GetTrackerCount(_refCount) > 0)
+                 && (IsSet(CreateComInterfaceFlagsEx::IsPegged)
+                     || InteropLibImports::GetGlobalPeggingState());
     }
 
-    return count;
+    return rooted;
 }
 
 ULONG ManagedObjectWrapper::AddRefFromReferenceTracker()
@@ -578,7 +556,29 @@ ULONG ManagedObjectWrapper::AddRefFromReferenceTracker()
 
 ULONG ManagedObjectWrapper::ReleaseFromReferenceTracker()
 {
-    return GetTrackerCount(UniversalRelease(TrackerRefCounter));
+    if (GetTrackerCount(_refCount) == 0)
+    {
+        _ASSERTE(!"Over release of MOW - ReferenceTracker");
+        return (ULONG)-1;
+    }
+
+    LONGLONG refCount;
+    LONGLONG prev;
+    do
+    {
+        prev = _refCount;
+        refCount = prev - TrackerRefCounter;
+    } while (::InterlockedCompareExchange64(&_refCount, refCount, prev) != prev);
+
+    // If we observe the destroy sentinel, then this release
+    // must destroy the wrapper.
+    if (refCount == DestroySentinel)
+    {
+        _ASSERTE(!IsSet(CreateComInterfaceFlagsEx::IsPegged));
+        Destroy(this);
+    }
+
+    return GetTrackerCount(refCount);
 }
 
 HRESULT ManagedObjectWrapper::Peg()
@@ -652,12 +652,20 @@ HRESULT ManagedObjectWrapper::QueryInterface(
 
 ULONG ManagedObjectWrapper::AddRef(void)
 {
+    _ASSERTE((_refCount & DestroySentinel) == 0);
     return GetComCount(::InterlockedIncrement64(&_refCount));
 }
 
 ULONG ManagedObjectWrapper::Release(void)
 {
-    return GetComCount(UniversalRelease(ComRefCounter));
+    _ASSERTE((_refCount & DestroySentinel) == 0);
+    if (GetComCount(_refCount) == 0)
+    {
+        _ASSERTE(!"Over release of MOW - COM");
+        return (ULONG)-1;
+    }
+
+    return GetComCount(::InterlockedDecrement64(&_refCount));
 }
 
 namespace
@@ -684,6 +692,7 @@ NativeObjectWrapperContext* NativeObjectWrapperContext::MapFromRuntimeContext(_I
 
 HRESULT NativeObjectWrapperContext::Create(
     _In_ IUnknown* external,
+    _In_opt_ IUnknown* inner,
     _In_ InteropLib::Com::CreateObjectFlags flags,
     _In_ size_t runtimeContextSize,
     _Outptr_ NativeObjectWrapperContext** context)
@@ -710,7 +719,7 @@ HRESULT NativeObjectWrapperContext::Create(
     // Contract specifically requires zeroing out runtime context.
     ::memset(runtimeContext, 0, runtimeContextSize);
 
-    NativeObjectWrapperContext* contextLocal = new (cxtMem) NativeObjectWrapperContext{ runtimeContext, trackerObject };
+    NativeObjectWrapperContext* contextLocal = new (cxtMem) NativeObjectWrapperContext{ runtimeContext, trackerObject, inner };
 
     if (trackerObject != nullptr)
     {
@@ -722,6 +731,13 @@ HRESULT NativeObjectWrapperContext::Create(
             Destroy(contextLocal);
             return hr;
         }
+
+        // Aggregation with a tracker object must be "cleaned up".
+        if (flags & InteropLib::Com::CreateObjectFlags_Aggregated)
+        {
+            _ASSERTE(inner != nullptr);
+            contextLocal->HandleReferenceTrackerAggregation();
+        }
     }
 
     *context = contextLocal;
@@ -732,27 +748,47 @@ void NativeObjectWrapperContext::Destroy(_In_ NativeObjectWrapperContext* wrappe
 {
     _ASSERTE(wrapper != nullptr);
 
+    // Check if the tracker object manager should be informed prior to being destroyed.
+    IReferenceTracker* trackerMaybe = wrapper->GetReferenceTracker();
+    if (trackerMaybe != nullptr)
+    {
+        // We only call this during a GC so ignore the failure as
+        // there is no way we can handle it at this point.
+        HRESULT hr = TrackerObjectManager::BeforeWrapperDestroyed(trackerMaybe);
+        _ASSERTE(SUCCEEDED(hr));
+        (void)hr;
+    }
+
     // Manually trigger the destructor since placement
     // new was used to allocate the object.
     wrapper->~NativeObjectWrapperContext();
     InteropLibImports::MemFree(wrapper, AllocScenario::NativeObjectWrapper);
 }
 
-NativeObjectWrapperContext::NativeObjectWrapperContext(_In_ void* runtimeContext, _In_opt_ IReferenceTracker* trackerObject)
+NativeObjectWrapperContext::NativeObjectWrapperContext(
+    _In_ void* runtimeContext,
+    _In_opt_ IReferenceTracker* trackerObject,
+    _In_opt_ IUnknown* nativeObjectAsInner)
     : _trackerObject{ trackerObject }
     , _runtimeContext{ runtimeContext }
-    , _isValidTracker{ (trackerObject != nullptr ? TRUE : FALSE) }
+    , _trackerObjectDisconnected{ FALSE }
+    , _trackerObjectState{ (trackerObject == nullptr ? TrackerObjectState::NotSet : TrackerObjectState::SetForRelease) }
+    , _nativeObjectAsInner{ nativeObjectAsInner }
 #ifdef _DEBUG
     , _sentinel{ LiveContextSentinel }
 #endif
 {
-    if (_isValidTracker == TRUE)
+    if (_trackerObjectState == TrackerObjectState::SetForRelease)
         (void)_trackerObject->AddRef();
 }
 
 NativeObjectWrapperContext::~NativeObjectWrapperContext()
 {
     DisconnectTracker();
+
+    // If the inner was supplied, we need to release our reference.
+    if (_nativeObjectAsInner != nullptr)
+        (void)_nativeObjectAsInner->Release();
 
 #ifdef _DEBUG
     _sentinel = DeadContextSentinel;
@@ -766,12 +802,43 @@ void* NativeObjectWrapperContext::GetRuntimeContext() const noexcept
 
 IReferenceTracker* NativeObjectWrapperContext::GetReferenceTracker() const noexcept
 {
-    return ((_isValidTracker == TRUE) ? _trackerObject : nullptr);
+    return ((_trackerObjectState == TrackerObjectState::NotSet) ? nullptr : _trackerObject);
 }
 
+// See TrackerObjectManager::AfterWrapperCreated() for AddRefFromTrackerSource() usage.
+// See NativeObjectWrapperContext::HandleReferenceTrackerAggregation() for additional
+// cleanup logistics.
 void NativeObjectWrapperContext::DisconnectTracker() noexcept
 {
-    // Attempt to disconnect from the tracker.
-    if (TRUE == ::InterlockedCompareExchange((LONG*)&_isValidTracker, FALSE, TRUE))
+    // Return if already disconnected or the tracker isn't set.
+    if (FALSE != ::InterlockedCompareExchange((LONG*)&_trackerObjectDisconnected, TRUE, FALSE)
+        || _trackerObjectState == TrackerObjectState::NotSet)
+    {
+        return;
+    }
+
+    _ASSERTE(_trackerObject != nullptr);
+
+    // Always release the tracker source during a disconnect.
+    // This to account for the implied IUnknown ownership by the runtime.
+    (void)_trackerObject->ReleaseFromTrackerSource(); // IUnknown
+
+    // Disconnect from the tracker.
+    if (_trackerObjectState == TrackerObjectState::SetForRelease)
+    {
+        (void)_trackerObject->ReleaseFromTrackerSource(); // IReferenceTracker
         (void)_trackerObject->Release();
+    }
+}
+
+void NativeObjectWrapperContext::HandleReferenceTrackerAggregation() noexcept
+{
+    _ASSERTE(_trackerObjectState == TrackerObjectState::SetForRelease && _trackerObject != nullptr);
+
+    // Aggregation with an IReferenceTracker instance creates an extra AddRef()
+    // on the outer (e.g. MOW) so we clean up that issue here.
+    _trackerObjectState = TrackerObjectState::SetNoRelease;
+
+    (void)_trackerObject->ReleaseFromTrackerSource(); // IReferenceTracker
+    (void)_trackerObject->Release();
 }

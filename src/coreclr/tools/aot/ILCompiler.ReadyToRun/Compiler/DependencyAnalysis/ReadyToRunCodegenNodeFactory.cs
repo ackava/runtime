@@ -55,6 +55,8 @@ namespace ILCompiler.DependencyAnalysis
 
         public CompilationModuleGroup CompilationModuleGroup { get; }
 
+        public ProfileDataManager ProfileDataManager { get; }
+
         public NameMangler NameMangler { get; }
 
         public MetadataManager MetadataManager { get; }
@@ -146,6 +148,7 @@ namespace ILCompiler.DependencyAnalysis
         public NodeFactory(
             CompilerTypeSystemContext context,
             CompilationModuleGroup compilationModuleGroup,
+            ProfileDataManager profileDataManager,
             NameMangler nameMangler,
             CopiedCorHeaderNode corHeaderNode,
             DebugDirectoryNode debugDirectoryNode,
@@ -154,6 +157,7 @@ namespace ILCompiler.DependencyAnalysis
         {
             TypeSystemContext = context;
             CompilationModuleGroup = compilationModuleGroup;
+            ProfileDataManager = profileDataManager;
             Target = context.Target;
             NameMangler = nameMangler;
             MetadataManager = new ReadyToRunTableManager(context);
@@ -209,6 +213,11 @@ namespace ILCompiler.DependencyAnalysis
             _constructedHelpers = new NodeCache<ReadyToRunHelper, Import>(helperId =>
             {
                 return new Import(EagerImports, new ReadyToRunHelperSignature(helperId));
+            });
+
+            _importThunks = new NodeCache<ImportThunkKey, ImportThunk>(key =>
+            {
+                return new ImportThunk(this, key.Helper, key.ContainingImportSection, key.UseVirtualCall);
             });
 
             _importMethods = new NodeCache<TypeAndMethod, IMethodNode>(CreateMethodEntrypoint);
@@ -312,6 +321,8 @@ namespace ILCompiler.DependencyAnalysis
         public ManifestMetadataTableNode ManifestMetadataTable;
 
         public ImportSectionsTableNode ImportSectionsTable;
+
+        public InstrumentationDataTableNode InstrumentationDataTable;
 
         public Import ModuleImport;
 
@@ -489,6 +500,47 @@ namespace ILCompiler.DependencyAnalysis
             return _typeSignatures.GetOrAdd(fixupKey);
         }
 
+        private struct ImportThunkKey : IEquatable<ImportThunkKey>
+        {
+            public readonly ReadyToRunHelper Helper;
+            public readonly ImportSectionNode ContainingImportSection;
+            public readonly bool UseVirtualCall;
+
+            public ImportThunkKey(ReadyToRunHelper helper, ImportSectionNode containingImportSection, bool useVirtualCall)
+            {
+                Helper = helper;
+                ContainingImportSection = containingImportSection;
+                UseVirtualCall = useVirtualCall;
+            }
+
+            public bool Equals(ImportThunkKey other)
+            {
+                return Helper == other.Helper &&
+                    ContainingImportSection == other.ContainingImportSection &&
+                    UseVirtualCall == other.UseVirtualCall;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is ImportThunkKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                return unchecked(31 * Helper.GetHashCode() +
+                    31 * ContainingImportSection.GetHashCode() +
+                    31 * UseVirtualCall.GetHashCode());
+            }
+        }
+
+        private NodeCache<ImportThunkKey, ImportThunk> _importThunks;
+
+        public ImportThunk ImportThunk(ReadyToRunHelper helper, ImportSectionNode containingImportSection, bool useVirtualCall)
+        {
+            ImportThunkKey thunkKey = new ImportThunkKey(helper, containingImportSection, useVirtualCall);
+            return _importThunks.GetOrAdd(thunkKey);
+        }
+
         public void AttachToDependencyGraph(DependencyAnalyzerBase<NodeFactory> graph)
         {
             var compilerIdentifierNode = new CompilerIdentifierNode(Target);
@@ -582,15 +634,38 @@ namespace ILCompiler.DependencyAnalysis
             {
                 Import personalityRoutineImport = new Import(EagerImports, new ReadyToRunHelperSignature(
                     ReadyToRunHelper.PersonalityRoutine));
-                PersonalityRoutine = new ImportThunk(
-                    ReadyToRunHelper.PersonalityRoutine, this, personalityRoutineImport, useVirtualCall: false);
+                PersonalityRoutine = new ImportThunk(this,
+                    ReadyToRunHelper.PersonalityRoutine, EagerImports, useVirtualCall: false);
                 graph.AddRoot(PersonalityRoutine, "Personality routine is faster to root early rather than referencing it from each unwind info");
 
                 Import filterFuncletPersonalityRoutineImport = new Import(EagerImports, new ReadyToRunHelperSignature(
                     ReadyToRunHelper.PersonalityRoutineFilterFunclet));
-                FilterFuncletPersonalityRoutine = new ImportThunk(
-                    ReadyToRunHelper.PersonalityRoutineFilterFunclet, this, filterFuncletPersonalityRoutineImport, useVirtualCall: false);
+                FilterFuncletPersonalityRoutine = new ImportThunk(this,
+                    ReadyToRunHelper.PersonalityRoutineFilterFunclet, EagerImports, useVirtualCall: false);
                 graph.AddRoot(FilterFuncletPersonalityRoutine, "Filter funclet personality routine is faster to root early rather than referencing it from each unwind info");
+            }
+
+            if ((ProfileDataManager != null) && (ProfileDataManager.EmbedPgoDataInR2RImage))
+            {
+                // Profile instrumentation data attaches here
+                HashSet<MethodDesc> methodsToInsertInstrumentationDataFor = new HashSet<MethodDesc>();
+                foreach (EcmaModule inputModule in CompilationModuleGroup.CompilationModuleSet)
+                {
+                    foreach (MethodDesc method in ProfileDataManager.GetMethodsForModuleDesc(inputModule))
+                    {
+                        if (ProfileDataManager[method].SchemaData != null)
+                        {
+                            methodsToInsertInstrumentationDataFor.Add(method);
+                        }
+                    }
+                }
+                if (methodsToInsertInstrumentationDataFor.Count != 0)
+                {
+                    MethodDesc[] methodsToInsert = methodsToInsertInstrumentationDataFor.ToArray();
+                    methodsToInsert.MergeSort(new TypeSystemComparer().Compare);
+                    InstrumentationDataTable = new InstrumentationDataTableNode(this, methodsToInsert, ProfileDataManager);
+                    Header.Add(Internal.Runtime.ReadyToRunSectionType.PgoInstrumentationData, InstrumentationDataTable, InstrumentationDataTable);
+                }
             }
 
             MethodImports = new ImportSectionNode(

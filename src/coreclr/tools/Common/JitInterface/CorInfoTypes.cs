@@ -4,6 +4,7 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Internal.Pgo;
 using Internal.TypeSystem;
 
 namespace Internal.JitInterface
@@ -63,8 +64,12 @@ namespace Internal.JitInterface
     public struct CORINFO_VarArgInfo
     {
     }
-    
+
     public struct PatchpointInfo
+    {
+    }
+
+    public struct MethodSignatureInfo
     {
     }
 
@@ -83,22 +88,24 @@ namespace Internal.JitInterface
     { }
 
     public enum HRESULT {
+        S_OK = 0,
         E_NOTIMPL = -2147467263
     }
 
     public unsafe struct CORINFO_SIG_INFO
     {
         public CorInfoCallConv callConv;
-        public CORINFO_CLASS_STRUCT_* retTypeClass;   // if the return type is a value class, this is its handle (enums are normalized)
-        public CORINFO_CLASS_STRUCT_* retTypeSigClass;// returns the value class as it is in the sig (enums are not converted to primitives)
+        public CORINFO_CLASS_STRUCT_* retTypeClass;     // if the return type is a value class, this is its handle (enums are normalized)
+        public CORINFO_CLASS_STRUCT_* retTypeSigClass;  // returns the value class as it is in the sig (enums are not converted to primitives)
         public byte _retType;
-        public CorInfoSigInfoFlags flags;    // used by IL stubs code
+        public CorInfoSigInfoFlags flags;               // used by IL stubs code
         public ushort numArgs;
-        public CORINFO_SIG_INST sigInst;  // information about how type variables are being instantiated in generic code
+        public CORINFO_SIG_INST sigInst;                // information about how type variables are being instantiated in generic code
         public CORINFO_ARG_LIST_STRUCT_* args;
         public byte* pSig;
         public uint cbSig;
-        public CORINFO_MODULE_STRUCT_* scope;          // passed to getArgClass
+        public MethodSignatureInfo* methodSignature;    // used in place of pSig and cbSig to reference a method signature object handle
+        public CORINFO_MODULE_STRUCT_* scope;           // passed to getArgClass
         public mdToken token;
 
         public CorInfoType retType { get { return (CorInfoType)_retType; } set { _retType = (byte)value; } }
@@ -296,6 +303,15 @@ namespace Internal.JitInterface
         public uint cbMethodSpec;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PgoInstrumentationSchema
+    {
+        public IntPtr Offset;
+        public PgoInstrumentationKind InstrumentationKind;
+        public int ILOffset;
+        public int Count;
+        public int Other;
+    }
 
     // Flags computed by a runtime compiler
     public enum CorInfoMethodRuntimeFlags
@@ -314,10 +330,11 @@ namespace Internal.JitInterface
         // These correspond to CorCallingConvention
 
         CORINFO_CALLCONV_DEFAULT = 0x0,
-        CORINFO_CALLCONV_C = 0x1,
-        CORINFO_CALLCONV_STDCALL = 0x2,
-        CORINFO_CALLCONV_THISCALL = 0x3,
-        CORINFO_CALLCONV_FASTCALL = 0x4,
+        // Instead of using the below values, use the CorInfoCallConvExtension enum for unmanaged calling conventions.
+        // CORINFO_CALLCONV_C = 0x1,
+        // CORINFO_CALLCONV_STDCALL = 0x2,
+        // CORINFO_CALLCONV_THISCALL = 0x3,
+        // CORINFO_CALLCONV_FASTCALL = 0x4,
         CORINFO_CALLCONV_VARARG = 0x5,
         CORINFO_CALLCONV_FIELD = 0x6,
         CORINFO_CALLCONV_LOCAL_SIG = 0x7,
@@ -332,15 +349,16 @@ namespace Internal.JitInterface
         CORINFO_CALLCONV_PARAMTYPE = 0x80,     // Passed last. Same as CORINFO_GENERICS_CTXT_FROM_PARAMTYPEARG
     }
 
-    public enum CorInfoUnmanagedCallConv
+    // Represents the calling conventions supported with the extensible calling convention syntax
+    // as well as the original metadata-encoded calling conventions.
+    enum CorInfoCallConvExtension
     {
-        // These correspond to CorUnmanagedCallingConvention
-
-        CORINFO_UNMANAGED_CALLCONV_UNKNOWN,
-        CORINFO_UNMANAGED_CALLCONV_C,
-        CORINFO_UNMANAGED_CALLCONV_STDCALL,
-        CORINFO_UNMANAGED_CALLCONV_THISCALL,
-        CORINFO_UNMANAGED_CALLCONV_FASTCALL
+        Managed,
+        C,
+        Stdcall,
+        Thiscall,
+        Fastcall
+        // New calling conventions supported with the extensible calling convention encoding go here.
     }
 
     public enum CORINFO_CALLINFO_FLAGS
@@ -352,7 +370,7 @@ namespace Internal.JitInterface
         CORINFO_CALLINFO_VERIFICATION = 0x0008,   // Gets extra verification information.
         CORINFO_CALLINFO_SECURITYCHECKS = 0x0010,   // Perform security checks.
         CORINFO_CALLINFO_LDFTN = 0x0020,   // Resolving target of LDFTN
-        CORINFO_CALLINFO_ATYPICAL_CALLSITE = 0x0040, // Atypical callsite that cannot be disassembled by delay loading helper
+        // UNUSED = 0x0040,
     }
 
     // Bit-twiddling of contexts assumes word-alignment of method handles and type handles
@@ -368,7 +386,7 @@ namespace Internal.JitInterface
     {
         CORINFO_SIGFLAG_IS_LOCAL_SIG = 0x01,
         CORINFO_SIGFLAG_IL_STUB = 0x02,
-        CORINFO_SIGFLAG_SUPPRESS_GC_TRANSITION = 0x04,
+        // unused = 0x04,
         CORINFO_SIGFLAG_FAT_CALL = 0x08,
     };
 
@@ -535,7 +553,7 @@ namespace Internal.JitInterface
         CORINFO_ACCESS_SET = 0x0200, // Field set (stfld)
         CORINFO_ACCESS_ADDRESS = 0x0400, // Field address (ldflda)
         CORINFO_ACCESS_INIT_ARRAY = 0x0800, // Field use for InitializeArray
-        CORINFO_ACCESS_ATYPICAL_CALLSITE = 0x4000, // Atypical callsite that cannot be disassembled by delay loading helper
+        // UNUSED = 0x4000,
         CORINFO_ACCESS_INLINECHECK = 0x8000, // Return fieldFlags and fieldAccessor only. Used by JIT64 during inlining.
     }
 
@@ -1047,7 +1065,7 @@ namespace Internal.JitInterface
         //
         public CORINFO_METHOD_STRUCT_* devirtualizedMethod;
         public byte _requiresInstMethodTableArg;
-        public bool requiresInstMethodTableArg { get { return _requiresInstMethodTableArg != 0; } set { _requiresInstMethodTableArg = value ? 1 : 0; } }
+        public bool requiresInstMethodTableArg { get { return _requiresInstMethodTableArg != 0; } set { _requiresInstMethodTableArg = value ? (byte)1 : (byte)0; } }
         public CORINFO_CONTEXT_STRUCT* exactContext;
     }
 
@@ -1294,7 +1312,7 @@ namespace Internal.JitInterface
         CORJIT_FLAG_MAKEFINALCODE = 18, // Use the final code generator, i.e., not the interpreter.
         CORJIT_FLAG_READYTORUN = 19, // Use version-resilient code generation
         CORJIT_FLAG_PROF_ENTERLEAVE = 20, // Instrument prologues/epilogues
-        CORJIT_FLAG_PROF_REJIT_NOPS = 21, // Insert NOPs to ensure code is re-jitable
+        CORJIT_FLAG_UNUSED7 = 21,
         CORJIT_FLAG_PROF_NO_PINVOKE_INLINE = 22, // Disables PInvoke inlining
         CORJIT_FLAG_SKIP_VERIFICATION = 23, // (lazy) skip verification - determined without doing a full resolve. See comment below
         CORJIT_FLAG_PREJIT = 24, // jit or prejit is the execution engine.
@@ -1305,13 +1323,13 @@ namespace Internal.JitInterface
         CORJIT_FLAG_BBINSTR = 29, // Collect basic block profile information
         CORJIT_FLAG_BBOPT = 30, // Optimize method based on profile information
         CORJIT_FLAG_FRAMED = 31, // All methods have an EBP frame
-        CORJIT_FLAG_ALIGN_LOOPS = 32, // add NOPs before loops to align them at 16 byte boundaries
+        CORJIT_FLAG_UNUSED8 = 32,
         CORJIT_FLAG_PUBLISH_SECRET_PARAM = 33, // JIT must place stub secret param into local 0.  (used by IL stubs)
-        CORJIT_FLAG_UNUSED8 = 34,
+        CORJIT_FLAG_UNUSED9 = 34,
         CORJIT_FLAG_SAMPLING_JIT_BACKGROUND = 35, // JIT is being invoked as a result of stack sampling for hot methods in the background
         CORJIT_FLAG_USE_PINVOKE_HELPERS = 36, // The JIT should use the PINVOKE_{BEGIN,END} helpers instead of emitting inline transitions
         CORJIT_FLAG_REVERSE_PINVOKE = 37, // The JIT should insert REVERSE_PINVOKE_{ENTER,EXIT} helpers into method prolog/epilog
-        CORJIT_FLAG_UNUSED9 = 38,
+        CORJIT_FLAG_TRACK_TRANSITIONS = 38, // The JIT should insert the helper variants that track transitions.
         CORJIT_FLAG_TIER0 = 39, // This is the initial tier for tiered compilation which should generate code as quickly as possible
         CORJIT_FLAG_TIER1 = 40, // This is the final tier (for now) for tiered compilation which should generate high quality code
         CORJIT_FLAG_RELATIVE_CODE_RELOCS = 41, // JIT should generate PC-relative address computations instead of EE relocation records

@@ -78,7 +78,7 @@ build_native()
     # All set to commence the build
     echo "Commencing build of \"$message\" for $__TargetOS.$__BuildArch.$__BuildType in $intermediatesDir"
 
-    if [[ "$targetOS" == OSX ]]; then
+    if [[ "$targetOS" == OSX || "$targetOS" == MacCatalyst ]]; then
         if [[ "$platformArch" == x64 ]]; then
             cmakeArgs="-DCMAKE_OSX_ARCHITECTURES=\"x86_64\" $cmakeArgs"
         elif [[ "$platformArch" == arm64 ]]; then
@@ -87,6 +87,10 @@ build_native()
             echo "Error: Unknown OSX architecture $platformArch."
             exit 1
         fi
+    fi
+
+    if [[ "$targetOS" == MacCatalyst ]]; then
+        cmakeArgs="-DCLR_CMAKE_TARGET_MACCATALYST=1 $cmakeArgs"
     fi
 
     if [[ "$__UseNinja" == 1 ]]; then
@@ -262,7 +266,8 @@ __msbuildonunsupportedplatform=0
 # processors available to a single process.
 platform="$(uname)"
 if [[ "$platform" == "FreeBSD" ]]; then
-  __NumProc=$(sysctl hw.ncpu | awk '{ print $2+1 }')
+  output=("$(sysctl hw.ncpu)")
+  __NumProc="$((output[1] + 1))"
 elif [[ "$platform" == "NetBSD" || "$platform" == "SunOS" ]]; then
   __NumProc=$(($(getconf NPROCESSORS_ONLN)+1))
 elif [[ "$platform" == "Darwin" ]]; then
@@ -276,7 +281,7 @@ while :; do
         break
     fi
 
-    lowerI="$(echo "$1" | awk '{print tolower($0)}')"
+    lowerI="$(echo "$1" | tr "[:upper:]" "[:lower:]")"
     case "$lowerI" in
         -\?|-h|--help)
             usage

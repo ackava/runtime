@@ -3621,7 +3621,7 @@ void CallFinalizerOnThreadObject(Object *obj)
     // still attached to the internal Thread object, before proceeding.
     if (thread)
     {
-        refThis->SetDelegate(NULL);
+        refThis->ResetStartHelper();
 
         // During process shutdown, we finalize even reachable objects.  But if we break
         // the link between the System.Thread and the internal Thread object, the runtime
@@ -5174,7 +5174,7 @@ void WalkValueTypeTypeDefOrRefs(
             IfFailThrow(sig.SkipExactlyOne());
 
             // Get number of parameters
-            ULONG argCnt;
+            uint32_t argCnt;
             IfFailThrow(sig.GetData(&argCnt));
             while (argCnt-- != 0)
             {   // Process and skip generic parameter

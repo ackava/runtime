@@ -50,10 +50,6 @@
 #include "roapi.h"
 #endif // FEATURE_COMINTEROP_APARTMENT_SUPPORT
 
-#ifdef FEATURE_PERFTRACING
-#include "eventpipebuffermanager.h"
-#endif // FEATURE_PERFTRACING
-
 static const PortableTailCallFrame g_sentinelTailCallFrame = { NULL, NULL, NULL };
 
 TailCallTls::TailCallTls()
@@ -106,7 +102,10 @@ thread_local int t_ForbidGCLoaderUseCount;
 uint64_t Thread::dead_threads_non_alloc_bytes = 0;
 
 SPTR_IMPL(ThreadStore, ThreadStore, s_pThreadStore);
-CONTEXT *ThreadStore::s_pOSContext = NULL;
+
+CONTEXT* ThreadStore::s_pOSContext = NULL;
+BYTE* ThreadStore::s_pOSContextBuffer = NULL;
+
 CLREvent *ThreadStore::s_pWaitForStackCrawlEvent;
 
 PTR_ThreadLocalModule ThreadLocalBlock::GetTLMIfExists(ModuleIndex index)
@@ -900,7 +899,7 @@ void DestroyThread(Thread *th)
 
     if (th->IsAbortRequested()) {
         // Reset trapping count.
-        th->UnmarkThreadForAbort(Thread::TAR_ALL);
+        th->UnmarkThreadForAbort();
     }
 
     // Clear any outstanding stale EH state that maybe still active on the thread.
@@ -989,7 +988,7 @@ HRESULT Thread::DetachThread(BOOL fDLLThreadDetach)
 
     if (IsAbortRequested()) {
         // Reset trapping count.
-        UnmarkThreadForAbort(Thread::TAR_ALL);
+        UnmarkThreadForAbort();
     }
 
     if (!IsBackground())
@@ -1162,6 +1161,9 @@ void InitThreadManager()
 #ifdef TARGET_ARM64
     // Store the JIT_WriteBarrier_Table copy location to a global variable so that it can be updated.
     JIT_WriteBarrier_Table_Loc = GetWriteBarrierCodeLocation((void*)&JIT_WriteBarrier_Table);
+
+    SetJitHelperFunction(CORINFO_HELP_CHECKED_ASSIGN_REF, GetWriteBarrierCodeLocation((void*)JIT_CheckedWriteBarrier));
+    SetJitHelperFunction(CORINFO_HELP_ASSIGN_BYREF, GetWriteBarrierCodeLocation((void*)JIT_ByRefWriteBarrier));
 #endif // TARGET_ARM64
 
 #else // FEATURE_WRITEBARRIER_COPY
@@ -1461,7 +1463,6 @@ Thread::Thread()
     NewHolder<Dbg_TrackSyncStack> trackSyncHolder(static_cast<Dbg_TrackSyncStack*>(m_pTrackSync));
 #endif  // TRACK_SYNC
 
-    m_RequestedStackSize = 0;
     m_PreventAsync = 0;
     m_pDomain = NULL;
 #ifdef FEATURE_COMINTEROP
@@ -1470,7 +1471,6 @@ Thread::Thread()
     m_fHasDeadThreadBeenConsideredForGCTrigger = false;
     m_TraceCallCount = 0;
     m_ThrewControlForThread = 0;
-    m_OSContext = NULL;
     m_ThreadTasks = (ThreadTasks)0;
     m_pLoadLimiter= NULL;
 
@@ -1486,7 +1486,6 @@ Thread::Thread()
    }
 
     m_AbortType = EEPolicy::TA_None;
-    m_AbortInfo = 0;
     m_AbortEndTime = MAXULONGLONG;
     m_RudeAbortEndTime = MAXULONGLONG;
     m_AbortController = 0;
@@ -1504,7 +1503,11 @@ Thread::Thread()
     NewHolder<CONTEXT> contextHolder(m_OSContext);
 
     m_pSavedRedirectContext = NULL;
-    NewHolder<CONTEXT> savedRedirectContextHolder(m_pSavedRedirectContext);
+    m_pOSContextBuffer = NULL;
+
+#ifdef _DEBUG
+    m_RedirectContextInUse = false;
+#endif
 
 #ifdef FEATURE_COMINTEROP
     m_pRCWStack = new RCWStackHeader();
@@ -1538,8 +1541,6 @@ Thread::Thread()
     m_pLastAVAddress = NULL;
 #endif // defined(GCCOVER_TOLERATE_SPURIOUS_AV)
 #endif // HAVE_GCCOVER
-
-    m_fCompletionPortDrained = FALSE;
 
     m_debuggerActivePatchSkipper = NULL;
     m_dwThreadHandleBeingUsed = 0;
@@ -1575,7 +1576,6 @@ Thread::Thread()
     trackSyncHolder.SuppressRelease();
 #endif
     contextHolder.SuppressRelease();
-    savedRedirectContextHolder.SuppressRelease();
 
 #ifdef FEATURE_COMINTEROP
     m_uliInitializeSpyCookie.QuadPart = 0ul;
@@ -1596,7 +1596,6 @@ Thread::Thread()
     memset(&m_activityId, 0, sizeof(m_activityId));
 #endif // FEATURE_PERFTRACING
     m_HijackReturnKind = RT_Illegal;
-    m_DeserializationTracker = NULL;
 
     m_currentPrepareCodeConfig = nullptr;
     m_isInForbidSuspendForDebuggerRegion = false;
@@ -1866,7 +1865,7 @@ FAILURE:
         SetThreadState(TS_FailStarted);
 
         if (GetThread() != NULL && IsAbortRequested())
-            UnmarkThreadForAbort(TAR_ALL);
+            UnmarkThreadForAbort();
 
         if (!fKeepTLS)
         {
@@ -1935,9 +1934,6 @@ FAILURE:
             END_PIN_PROFILER();
         }
 #endif // PROFILING_SUPPORTED
-
-        // CoreCLR does not support user-requested thread suspension
-        _ASSERTE(!(m_State & TS_SuspendUnstarted));
     }
 
     return res;
@@ -2558,7 +2554,7 @@ Thread::~Thread()
     // we need to unmark it so that g_TrapReturningThreads is decremented.
     if (IsAbortRequested())
     {
-        UnmarkThreadForAbort(TAR_ALL);
+        UnmarkThreadForAbort();
     }
 
 #if defined(_DEBUG) && defined(TRACK_SYNC)
@@ -2610,11 +2606,18 @@ Thread::~Thread()
     if (m_OSContext)
         delete m_OSContext;
 
-    if (GetSavedRedirectContext())
+    if (m_pOSContextBuffer)
     {
-        delete GetSavedRedirectContext();
-        SetSavedRedirectContext(NULL);
+        delete[] m_pOSContextBuffer;
+        m_pOSContextBuffer = NULL;
     }
+    else if (m_pSavedRedirectContext)
+    {
+        delete m_pSavedRedirectContext;
+    }
+
+    MarkRedirectContextInUse(m_pSavedRedirectContext);
+    m_pSavedRedirectContext = NULL;
 
 #ifdef FEATURE_COMINTEROP
     if (m_pRCWStack)
@@ -2632,11 +2635,6 @@ Thread::~Thread()
     {
         // Destroy any handles that we're using to hold onto exception objects
         SafeSetThrowables(NULL);
-
-        if (m_DeserializationTracker != NULL)
-        {
-            DestroyGlobalStrongHandle(m_DeserializationTracker);
-        }
 
         DestroyShortWeakHandle(m_ExposedObject);
         DestroyStrongHandle(m_StrongHndToExposedObject);
@@ -3036,7 +3034,7 @@ void Thread::OnThreadTerminate(BOOL holdingLock)
 
             if (CurrentThreadID == ThisThreadID && IsAbortRequested())
             {
-                UnmarkThreadForAbort(Thread::TAR_ALL);
+                UnmarkThreadForAbort();
             }
         }
 
@@ -7515,9 +7513,7 @@ static void ManagedThreadBase_DispatchOuter(ManagedThreadCallState *pCallState)
             ExceptionTracker::PopTrackers(pArgs->pFrame);
     #endif // FEATURE_EH_FUNCLETS
 
-            // Fortunately, ThreadAbortExceptions are always
-            if (pArgs->pThread->IsAbortRequested())
-                pArgs->pThread->EEResetAbort(Thread::TAR_Thread);
+            _ASSERTE(!pArgs->pThread->IsAbortRequested());
         }
         PAL_ENDTRY;
 
@@ -8020,11 +8016,8 @@ void Thread::InternalReset(BOOL fNotFinalizerThread, BOOL fThreadObjectResetNeed
     }
 
     if (fResetAbort && IsAbortRequested()) {
-        UnmarkThreadForAbort(TAR_ALL);
+        UnmarkThreadForAbort();
     }
-
-    if (fResetAbort && IsAborted())
-        ClearAborted();
 
     if (IsThreadPoolThread() && fThreadObjectResetNeeded)
     {
@@ -8552,30 +8545,3 @@ ThreadStore::EnumMemoryRegions(CLRDataEnumMemoryFlags flags)
 }
 
 #endif // #ifdef DACCESS_COMPILE
-
-OBJECTHANDLE Thread::GetOrCreateDeserializationTracker()
-{
-    CONTRACTL
-    {
-        THROWS;
-        GC_TRIGGERS;
-        MODE_COOPERATIVE;
-    }
-    CONTRACTL_END;
-
-#if !defined (DACCESS_COMPILE)
-    if (m_DeserializationTracker != NULL)
-    {
-        return m_DeserializationTracker;
-    }
-
-    _ASSERTE(this == GetThread());
-
-    MethodTable* pMT = CoreLibBinder::GetClass(CLASS__DESERIALIZATION_TRACKER);
-    m_DeserializationTracker = CreateGlobalStrongHandle(AllocateObject(pMT));
-
-    _ASSERTE(m_DeserializationTracker != NULL);
-#endif // !defined (DACCESS_COMPILE)
-
-    return m_DeserializationTracker;
-}
